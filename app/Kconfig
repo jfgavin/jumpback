@@ -1,0 +1,33 @@
+# Copyright (c) 2026 Josh Gav
+# SPDX-License-Identifier: Apache-2.0
+
+mainmenu "Jumpback"
+
+config ST7306_WAVESHARE
+	bool "Waveshare ST7306 landscape display driver"
+	default y
+	depends on DT_HAS_WAVESHARE_ST7306_LANDSCAPE_ENABLED
+	select MIPI_DBI
+	help
+	  Landscape (400x300) driver for the reflective LCD on the Waveshare
+	  ESP32-S3-RLCD-4.2. Rotates the framebuffer 90 degrees in software,
+	  which the panel needs because it is physically portrait and the
+	  ST7306 has no hardware landscape mode.
+
+if ST7306_WAVESHARE
+
+config ST7306_WAVESHARE_CONV_BUFFER_STRIPS
+	int "Conversion buffer size, in panel row-address strips"
+	default 16
+	range 1 200
+	help
+	  How much of the rotated frame is staged in RAM before being sent to
+	  the panel. One strip is one row address: two panel rows of 300 pixels
+	  at 1bpp, so 75 bytes on this board. The default of 16 costs 1200 bytes
+	  and sends the frame in 13 chunks. Raising it reduces SPI transaction
+	  overhead at the cost of RAM; 200 stages the whole frame, for 15000
+	  bytes.
+
+endif # ST7306_WAVESHARE
+
+source "Kconfig.zephyr"

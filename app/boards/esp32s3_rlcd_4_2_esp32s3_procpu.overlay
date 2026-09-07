@@ -1,0 +1,151 @@
+/*
+ * Copyright (c) 2026 Josh Gav
+ *
+ * Waveshare ESP32-S3-RLCD-4.2, in landscape.
+ *
+ * The board's own devicetree describes the panel through the upstream
+ * sitronix,st7306 binding, which drives it in its physical portrait
+ * orientation. This overlay replaces that node with a
+ * waveshare,st7306-landscape node so the app gets a 400x300 display instead.
+ *
+ * === Why landscape needs a different node, not just different properties ===
+ *
+ * The ST7306 has no hardware landscape mode. Its MADCTL MV bit only chooses
+ * whether the RAM address counter walks X or Y while writing; the controller's
+ * 720 source and 480 gate lines are wired to the glass in one fixed
+ * arrangement. Rotation has to happen in software, and because it swaps the
+ * meaning of width and height it changes the driver's whole addressing scheme
+ * - hence a separate driver and binding rather than a property on the existing
+ * one.
+ *
+ * === Why landscape also gains 12 columns of glass ===
+ *
+ * The upstream driver derives its row stride from the display width, so that
+ * width has to be a multiple of both 12 (the controller's column address unit)
+ * and 8 (a packed 1bpp row must be whole bytes). The panel is 300 wide, which
+ * is a multiple of 12 but not of 8, so the portrait configuration had to
+ * declare width = <288> and give up the 12 rightmost columns.
+ *
+ * Rotated, each constraint lands on the axis that satisfies it exactly: the
+ * 400-pixel landscape width is 50 whole bytes, and the 300 landscape rows map
+ * onto 300/12 = 25 column addresses. Nothing is truncated, so the app draws
+ * into the full 400x300.
+ */
+
+/* The portrait node and the landscape node drive the same hardware. */
+&st7306 {
+	status = "disabled";
+};
+
+/*
+ * The board declares the MIPI DBI bus as an unlabeled node, so it is extended
+ * here by path rather than through a &label reference.
+ */
+/ {
+	mipi_dbi {
+		st7306_landscape: st7306_landscape@0 {
+			status = "okay";
+			compatible = "waveshare,st7306-landscape";
+			reg = <0>;
+			mipi-max-frequency = <10000000>;
+			mipi-mode = "MIPI_DBI_MODE_SPI_4WIRE";
+
+			/*
+			 * The glass, in its own portrait orientation. The
+			 * driver reports the transpose - 400x300 - to the
+			 * application.
+			 *
+			 * This is the real 300, not the 288 the portrait build
+			 * needed: see the note above on why rotating recovers
+			 * those columns.
+			 */
+			panel-width = <300>;
+			panel-height = <400>;
+
+			/*
+			 * The same glass as the application sees it: the
+			 * transpose of the two above. Reported through the
+			 * display API and read by ui.h, so layout code works
+			 * in landscape coordinates and never sees the panel's
+			 * portrait geometry.
+			 */
+			width = <400>;
+			height = <300>;
+
+			start-line = <0>;
+
+			/*
+			 * Offset of the wired glass inside the controller's
+			 * 720-column RAM.
+			 *
+			 * Not the board node's 204. That value pairs with its
+			 * width = <312>, giving column addresses 17..42, i.e.
+			 * pixels 204..515. The glass is only 300 wide, and
+			 * Waveshare's own driver addresses it as column
+			 * addresses 0x12..0x2A (18..42), i.e. pixels 216..515.
+			 *
+			 * Both descriptions end at the same right-hand column,
+			 * so the 12 columns that are not wired to glass are at
+			 * the START of the span, not the end. A 300-wide window
+			 * therefore begins at 216; starting at 204 shifts the
+			 * whole image one column address off the panel and
+			 * leaves a 12-pixel dead strip at the far edge.
+			 */
+			start-column = <216>;
+
+			nvm-load = [17 02];
+			gate-voltages = [11 04];
+			vsh = [69 69 69 69];
+			vsl = [19 19 19 19];
+			vshn = [4b 4b 4b 4b];
+			vsln = [19 19 19 19];
+			osc-settings = <0x80>;
+
+			/*
+			 * Bit [4] selects the high power mode frame rate: the
+			 * board's stock 0x02 gives 25.5Hz, 0x12 gives 51Hz.
+			 * The tachometer redraws every frame, so take the
+			 * faster one. The low power bits [2-0] stay at 2, as
+			 * the board had them.
+			 */
+			framerate = <0x12>;
+
+			multiplex-ratio = <0x64>;
+			source-voltage = <0x00>;
+
+			/*
+			 * MADCTL, from the board's node. Bit [5] (MV) is clear
+			 * and must stay clear - the driver emits data in the
+			 * controller's horizontal scan order and rotates it
+			 * itself.
+			 */
+			remap-value = <0x48>;
+
+			panel-settings = <0x29>;
+			hpm-gate-waveform = [e5 f6 05 46 77 77 77 77 76 45];
+			lpm-gate-waveform = [05 46 77 77 77 77 76 45];
+
+			/*
+			 * Inversion is deliberately NOT set, even though the
+			 * board's own node sets it and Waveshare's driver
+			 * sends 0x21.
+			 *
+			 * Their pipeline needs it because their flush writes a
+			 * set bit for white (RLCD_SetPixel treats the colour
+			 * as a flag, and ColorWhite is non-zero). Ours arrives
+			 * with the opposite sense: Zephyr's mono glue clears
+			 * the buffer to 0x00 for MONO01 and sets a bit per lit
+			 * LVGL pixel, and this panel drives a set RAM bit dark
+			 * - so the two inversions would cancel and the white
+			 * background would come out black.
+			 *
+			 * This was confirmed on the hardware: adding
+			 * inversion-on turned the display white-on-black.
+			 */
+		};
+	};
+
+	chosen {
+		zephyr,display = &st7306_landscape;
+	};
+};

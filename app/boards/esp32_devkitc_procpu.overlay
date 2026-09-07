@@ -1,0 +1,20 @@
+/*
+ * Copyright (c) 2026 Josh Gav
+ */
+
+#include <zephyr/dt-bindings/gpio/gpio.h>
+
+/ {
+	aliases {
+		led0 = &user_led;
+	};
+
+	leds {
+		compatible = "gpio-leds";
+
+		user_led: led_0 {
+			gpios = <&gpio0 2 GPIO_ACTIVE_HIGH>;
+			label = "User LED";
+		};
+	};
+};

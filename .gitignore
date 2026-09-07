@@ -1,0 +1,15 @@
+# West managed
+/zephyr/
+/modules/
+/bootloader/
+/tools/
+/doc/
+
+# West env
+/.west/
+
+# Build
+build/
+
+# Python
+/.venv/
