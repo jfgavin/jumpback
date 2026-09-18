@@ -16,9 +16,8 @@
 LOG_MODULE_REGISTER(app, LOG_LEVEL_INF);
 
 #define FRAME_INTERVAL_MS     20
-#define RPM_STEP              300
+#define SWEEP_PERIOD_MS       3000
 #define HEARTBEAT_INTERVAL_MS 1000
-#define FRAMES_PER_HEARTBEAT  (HEARTBEAT_INTERVAL_MS / FRAME_INTERVAL_MS)
 
 #define MODEL_NAME      "JMP-1"
 #define MODEL_NAME_FONT lv_font_montserrat_28
@@ -40,6 +39,26 @@ static void draw_model_name(lv_event_t *e)
 	dsc.text = MODEL_NAME;
 
 	lv_draw_label(layer, &dsc, &area);
+}
+
+static int32_t sweep_rpm(int64_t elapsed_ms, int32_t rpm_max)
+{
+	const int32_t phase = (int32_t)(elapsed_ms % SWEEP_PERIOD_MS);
+
+	return (int32_t)(((int64_t)phase * rpm_max) / SWEEP_PERIOD_MS);
+}
+
+static void sleep_until_next_frame(int64_t *next_frame)
+{
+	const int64_t now = k_uptime_get();
+
+	*next_frame += FRAME_INTERVAL_MS;
+
+	if (*next_frame <= now) {
+		*next_frame = now + FRAME_INTERVAL_MS;
+	} else {
+		k_msleep((int32_t)(*next_frame - now));
+	}
 }
 
 int main(void)
@@ -70,20 +89,23 @@ int main(void)
 	}
 
 	const int32_t rpm_max = tacho_get_rpm_max(&tacho);
-	int32_t rpm = 0;
-	uint32_t frame = 0;
+	const int64_t start = k_uptime_get();
+	int64_t next_frame = start;
+	int64_t last_heartbeat = start;
 
 	while (true) {
+		const int32_t rpm = sweep_rpm(k_uptime_get() - start, rpm_max);
+
 		tacho_set_rpm(&tacho, rpm);
 
-		rpm = (rpm + RPM_STEP > rpm_max) ? 0 : rpm + RPM_STEP;
-
-		if (++frame % FRAMES_PER_HEARTBEAT == 0) {
+		if (k_uptime_get() - last_heartbeat >= HEARTBEAT_INTERVAL_MS) {
+			last_heartbeat = k_uptime_get();
 			LOG_INF("alive: rpm=%d", rpm);
 		}
 
 		lv_timer_handler();
-		k_msleep(FRAME_INTERVAL_MS);
+
+		sleep_until_next_frame(&next_frame);
 	}
 
 	return 0;
