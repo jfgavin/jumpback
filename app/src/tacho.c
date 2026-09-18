@@ -24,8 +24,7 @@
 
 /*
  * Inset of the track from the canvas edge. Derived from the stroke width so a
- * wider track cannot clip itself; unrelated to UI_MARGIN, which insets
- * top-level content from the screen edge.
+ * wider track cannot clip itself.
  */
 #define TRACK_INSET (TRACK_WIDTH / 2 + 2)
 
@@ -319,13 +318,113 @@ static void canvas_fill_bg_fast(lv_obj_t *canvas, lv_color_t color)
 	lv_memset(data, fill, draw_buf->header.stride * draw_buf->header.h);
 
 	lv_draw_buf_flush_cache(draw_buf, NULL);
-	lv_obj_invalidate(canvas);
+	/*
+	 * Deliberately no lv_obj_invalidate() here. The canvas is redrawn in
+	 * full every frame, but only a short length of the fill actually
+	 * changes, and marking the whole object dirty would make LVGL flush
+	 * the entire screen no matter how little moved. tacho_redraw()
+	 * invalidates just the span between the old and new fill ends.
+	 */
 #else
 	lv_canvas_fill_bg(canvas, color, LV_OPA_COVER);
+	/*
+	 * The generic path does invalidate, and off the 1bpp panel there is no
+	 * addressing constraint to work around, so leave that behaviour alone.
+	 */
 #endif
 }
 
-static void tacho_redraw(const struct tacho *t)
+/*
+ * Mark dirty just the stretch of track between two fill lengths.
+ *
+ * The canvas is repainted in full each frame, but what actually changes is
+ * the short run of track between the old fill end and the new one. Handing
+ * LVGL that rectangle instead of the whole object is what lets the driver
+ * flush a band rather than the screen.
+ *
+ * The span is the bounding box of the two endpoints, widened by the track
+ * width so the stroke, its rounded cap and the ticks cut through it are all
+ * covered. Both endpoints are included so the gauge redraws correctly whether
+ * the needle rose or fell.
+ */
+/*
+ * The span tacho_redraw() last touched, in canvas coordinates.
+ *
+ * lv_canvas_finish_layer() ends every redraw with lv_obj_invalidate() on the
+ * whole canvas, and because the canvas covers the screen that is a
+ * full-screen invalidation - which lv_inv_area() then lets swallow any
+ * smaller area added afterwards. Rather than fight LVGL over the order,
+ * the widget records what actually changed here and tacho_dirty_span()
+ * hands it to the display rounder, which narrows the area on its way out.
+ */
+static lv_area_t tacho_dirty;
+static bool tacho_dirty_valid;
+
+bool tacho_dirty_span(lv_area_t *out)
+{
+	if (!tacho_dirty_valid) {
+		return false;
+	}
+
+	*out = tacho_dirty;
+	return true;
+}
+
+static void invalidate_fill_span(const struct tacho *t, const lv_point_precise_t *pts,
+				 int32_t total, int32_t old_rpm, int32_t new_rpm)
+{
+	lv_point_t a;
+	lv_point_t b;
+	int32_t nx;
+	int32_t ny;
+	lv_area_t dirty;
+	/*
+	 * Half the track width plus the tick half-length and a pixel of slack.
+	 * The ticks reach further from the centreline than the stroke does.
+	 */
+	const int32_t pad = TRACK_WIDTH / 2 + TICK_HALF_LEN + 1;
+
+	if (!track_point_at(pts, rpm_to_dist(t, old_rpm, total), &a, &nx, &ny) ||
+	    !track_point_at(pts, rpm_to_dist(t, new_rpm, total), &b, &nx, &ny)) {
+		/* Should not happen; fall back to repainting everything. */
+		tacho_dirty_valid = false;
+		lv_obj_invalidate(t->canvas);
+		return;
+	}
+
+	dirty.x1 = (a.x < b.x ? a.x : b.x) - pad;
+	dirty.x2 = (a.x > b.x ? a.x : b.x) + pad;
+	dirty.y1 = (a.y < b.y ? a.y : b.y) - pad;
+	dirty.y2 = (a.y > b.y ? a.y : b.y) + pad;
+
+	/*
+	 * Clamp to the canvas. The padding pushes the box past the edge
+	 * whenever the fill is near one, and a negative coordinate reaches the
+	 * driver as a large unsigned value that fails its alignment check.
+	 */
+	if (dirty.x1 < 0) {
+		dirty.x1 = 0;
+	}
+	if (dirty.y1 < 0) {
+		dirty.y1 = 0;
+	}
+	if (dirty.x2 > t->cfg.width - 1) {
+		dirty.x2 = t->cfg.width - 1;
+	}
+	if (dirty.y2 > t->cfg.height - 1) {
+		dirty.y2 = t->cfg.height - 1;
+	}
+
+	/*
+	 * Recorded rather than invalidated directly: finish_layer() has
+	 * already marked the whole canvas, so adding a contained area here
+	 * would simply be absorbed.
+	 */
+	tacho_dirty = dirty;
+	tacho_dirty_valid = true;
+}
+
+static void tacho_redraw(const struct tacho *t, int32_t old_rpm)
 {
 	lv_point_precise_t pts[TRACK_PT_CNT];
 	lv_layer_t layer;
@@ -379,6 +478,18 @@ static void tacho_redraw(const struct tacho *t)
 	draw_ticks(t, &layer, pts, total);
 
 	lv_canvas_finish_layer(t->canvas, &layer);
+
+	/*
+	 * Now that the canvas holds the new frame, tell LVGL which part of it
+	 * differs from the last one. A negative old_rpm means "no previous
+	 * frame", i.e. the initial draw, which has to repaint everything.
+	 */
+	if (old_rpm < 0) {
+		tacho_dirty_valid = false;
+		lv_obj_invalidate(t->canvas);
+	} else {
+		invalidate_fill_span(t, pts, total, old_rpm, t->rpm);
+	}
 }
 
 /* Fill in any config field the caller left zero. */
@@ -451,7 +562,7 @@ int tacho_init(struct tacho *t, lv_obj_t *parent, const struct tacho_config *cfg
 
 	lv_obj_center(t->canvas);
 
-	tacho_redraw(t);
+	tacho_redraw(t, -1);
 
 	return 0;
 }
@@ -469,8 +580,10 @@ void tacho_set_rpm(struct tacho *t, int32_t rpm)
 		return;
 	}
 
+	const int32_t old_rpm = t->rpm;
+
 	t->rpm = rpm;
-	tacho_redraw(t);
+	tacho_redraw(t, old_rpm);
 }
 
 int32_t tacho_get_rpm(const struct tacho *t)

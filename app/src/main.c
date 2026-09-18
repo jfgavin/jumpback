@@ -40,28 +40,58 @@ LOG_MODULE_REGISTER(app, LOG_LEVEL_INF);
 #define SWEEP_PERIOD_MS 3000
 
 /*
- * Model name, drawn straight onto the screen rather than into a widget. Uses
- * an event callback because a screen has no canvas layer of its own - LVGL
- * hands one over during the draw pass.
+ * Round an invalidated area out to what the controller can address.
+ *
+ * Registered after the Zephyr glue's own rounder, so it runs second and has
+ * the final say. The glue's mono rounder aligns with power-of-two bitmasks,
+ * which cannot express this panel's 12-pixel column unit; without this the
+ * driver would reject the flush.
+ *
+ * Only correct while the display is the ST7306 in landscape. On native_sim
+ * the SDL panel has no such constraint, so the whole callback is compiled out
+ * and LVGL's own areas are used unchanged.
  */
-static void draw_jumpback(lv_event_t *e)
+#if DT_NODE_HAS_COMPAT(DT_CHOSEN(zephyr_display), waveshare_st7306_landscape)
+static void round_area_cb(lv_event_t *e)
 {
-	lv_layer_t *layer = lv_event_get_layer(e);
-	lv_draw_label_dsc_t dsc;
-	lv_area_t area;
+	lv_area_t *area = lv_event_get_param(e);
 
-	lv_draw_label_dsc_init(&dsc);
-	dsc.font = &lv_font_montserrat_28;
-	dsc.color = lv_color_hex(UI_COLOR_DIM);
-	dsc.text = "JMP-1";
+	lv_area_t span;
 
-	area.x1 = UI_MARGIN;
-	area.y1 = UI_MARGIN;
-	area.x2 = UI_SCREEN_W - UI_MARGIN;
-	area.y2 = UI_SCREEN_H - UI_MARGIN;
+	/*
+	 * Narrow a canvas-wide invalidation to what the gauge actually
+	 * changed. lv_canvas_finish_layer() marks the whole canvas dirty at
+	 * the end of every redraw, and since the canvas covers the screen
+	 * that would flush all 120000 pixels however little moved.
+	 */
+	if (tacho_dirty_span(&span) && lv_area_get_width(area) >= UI_SCREEN_W &&
+	    lv_area_get_height(area) >= UI_SCREEN_H) {
+		*area = span;
+	}
 
-	lv_draw_label(layer, &dsc, &area);
+	/* Defensive: LVGL may hand over areas reaching past the screen. */
+	if (area->x1 < 0) {
+		area->x1 = 0;
+	}
+	if (area->y1 < 0) {
+		area->y1 = 0;
+	}
+
+	area->x1 = (area->x1 / UI_FLUSH_ALIGN_X) * UI_FLUSH_ALIGN_X;
+	area->x2 = ((area->x2 / UI_FLUSH_ALIGN_X) + 1) * UI_FLUSH_ALIGN_X - 1;
+
+	area->y1 = (area->y1 / UI_FLUSH_ALIGN_Y) * UI_FLUSH_ALIGN_Y;
+	area->y2 = ((area->y2 / UI_FLUSH_ALIGN_Y) + 1) * UI_FLUSH_ALIGN_Y - 1;
+
+	/* Rounding out can overshoot the screen; the driver rejects that. */
+	if (area->x2 >= UI_SCREEN_W) {
+		area->x2 = UI_SCREEN_W - 1;
+	}
+	if (area->y2 >= UI_SCREEN_H) {
+		area->y2 = UI_SCREEN_H - 1;
+	}
 }
+#endif
 
 int main(void)
 {
@@ -77,13 +107,19 @@ int main(void)
 		return 0;
 	}
 
+#if DT_NODE_HAS_COMPAT(DT_CHOSEN(zephyr_display), waveshare_st7306_landscape)
+	/*
+	 * Added after lvgl_display.c has registered the glue's rounder, so
+	 * this one runs last and its alignment is what reaches the driver.
+	 */
+	lv_display_add_event_cb(lv_display_get_default(), round_area_cb,
+				LV_EVENT_INVALIDATE_AREA, NULL);
+#endif
+
 	screen = lv_screen_active();
 
 	// Set static background
 	lv_obj_set_style_bg_color(screen, lv_color_hex(UI_COLOR_BG), LV_PART_MAIN);
-
-	// Runs on every redraw of the screen, after its own background.
-	lv_obj_add_event_cb(screen, draw_jumpback, LV_EVENT_DRAW_MAIN_END, NULL);
 
 	// Drop interactive scrollbars
 	lv_obj_remove_flag(screen, LV_OBJ_FLAG_SCROLLABLE);
@@ -102,6 +138,11 @@ int main(void)
 	const int64_t start = k_uptime_get();
 	int64_t next_frame = start;
 	int64_t last_log = start;
+#ifdef CONFIG_JUMPBACK_FPS_COUNTER
+	/* Frames and cumulative render time since the last heartbeat. */
+	uint32_t frames = 0;
+	int64_t render_total = 0;
+#endif
 
 	while (1) {
 		/*
@@ -128,12 +169,44 @@ int main(void)
 		 * same reason the needle is: a frame count logs at a different
 		 * real-world rate on each platform.
 		 */
-		if (k_uptime_get() - last_log >= 1000) {
-			last_log = k_uptime_get();
-			LOG_INF("alive: rpm=%d", rpm);
-		}
+#ifdef CONFIG_JUMPBACK_FPS_COUNTER
+		const int64_t render_start = k_uptime_get();
+#endif
 
 		lv_timer_handler();
+
+#ifdef CONFIG_JUMPBACK_FPS_COUNTER
+		render_total += k_uptime_get() - render_start;
+		frames++;
+#endif
+
+		/*
+		 * Reported on the same timer as the heartbeat so the counter
+		 * adds no console traffic of its own - logging is expensive
+		 * enough here to skew what it is measuring.
+		 */
+		if (k_uptime_get() - last_log >= 1000) {
+#ifdef CONFIG_JUMPBACK_FPS_COUNTER
+			const int64_t window = k_uptime_get() - last_log;
+#endif
+
+			last_log = k_uptime_get();
+#ifdef CONFIG_JUMPBACK_FPS_COUNTER
+			/*
+			 * Scaled by 10 rather than floated: a tenth of a frame
+			 * per second is finer than the measurement is stable
+			 * to, and this build has no float printf.
+			 */
+			LOG_INF("alive: rpm=%d | %u.%u fps | render %u ms", rpm,
+				(unsigned int)(frames * 1000 / window),
+				(unsigned int)((frames * 10000 / window) % 10),
+				(unsigned int)(frames ? render_total / frames : 0));
+			frames = 0;
+			render_total = 0;
+#else
+			LOG_INF("alive: rpm=%d", rpm);
+#endif
+		}
 
 		/*
 		 * Sleep to the next frame boundary rather than for a fixed

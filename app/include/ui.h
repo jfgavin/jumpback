@@ -27,20 +27,6 @@
 #define UI_SCREEN_H DT_PROP(DT_CHOSEN(zephyr_display), height)
 
 /*
- * Inset from the screen edge for top-level content.
- *
- * On this panel the value is no longer constrained by the controller. The
- * landscape driver takes full-frame writes only and does the 12-pixel column
- * alignment itself, against the panel's own axis, so a margin in landscape
- * coordinates is just a layout choice - unlike the portrait configuration,
- * where a margin that was not a multiple of 12 made the driver reject the
- * flush outright and the gauge silently never appeared.
- *
- * 12 is kept because the layout was tuned around it and it still looks right.
- */
-#define UI_MARGIN 12
-
-/*
  * === Shared palette, 0xRRGGBB ===
  *
  * The reflective LCD is 1 bit per pixel: the board's Kconfig.defconfig pins
@@ -97,13 +83,39 @@
 /*
  * Gauge canvas size: the whole screen.
  *
- * The canvas used to be inset by UI_MARGIN on each side, which left a visible
- * band of background all the way around it - and because the track then insets
- * itself again inside the canvas, the padding was applied twice over. The
- * canvas now covers the panel edge to edge and the only inset is the track's
- * own, so the gauge uses all the glass.
+ * The canvas used to be inset on each side, which left a visible band of
+ * background all the way around it - and because the track then insets itself
+ * again inside the canvas, the padding was applied twice over. The canvas now
+ * covers the panel edge to edge and the only inset is the track's own, so the
+ * gauge uses all the glass.
  */
 #define UI_GAUGE_W UI_SCREEN_W
 #define UI_GAUGE_H UI_SCREEN_H
+
+/*
+ * === Flush alignment ===
+ *
+ * The panel is addressed in units of 12 columns by 2 rows, and the driver
+ * rotates the image 90 degrees, so those two units land on different
+ * application axes: a landscape Y span maps to panel columns (12) and a
+ * landscape X span to panel rows (2).
+ *
+ * Zephyr's mono rounder cannot express this. It aligns with power-of-two
+ * bitmasks, and 12 is not one, which is why the driver used to declare
+ * SCREEN_INFO_X_ALIGNMENT_WIDTH and take the whole screen every flush. The
+ * application rounds the area itself instead, and the driver validates.
+ *
+ * X is 8 rather than the controller's own 2 because the packing, not the
+ * controller, is the tighter constraint on that axis. A 1bpp row of the
+ * flushed band has to be a whole number of bytes: Zephyr's mono glue packs
+ * with `y * width / 8` and the driver's rotation reads back with the same
+ * integer division, so a width that is not a multiple of 8 truncates the
+ * stride and every row after the first is read at the wrong offset. That
+ * renders as garbage inside an otherwise correctly placed band - the shape
+ * is right because the window addressing is right, but the contents are
+ * gathered from the wrong bits.
+ */
+#define UI_FLUSH_ALIGN_X 8
+#define UI_FLUSH_ALIGN_Y 12
 
 #endif /* UI_H_ */

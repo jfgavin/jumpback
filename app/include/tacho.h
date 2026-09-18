@@ -2,6 +2,7 @@
 #define TACHO_H_
 
 #include <lvgl.h>
+#include <stdbool.h>
 #include <stdint.h>
 
 struct tacho_config {
@@ -64,5 +65,17 @@ void tacho_set_rpm(struct tacho *t, int32_t rpm);
 int32_t tacho_get_rpm(const struct tacho *t);
 
 int32_t tacho_get_rpm_max(const struct tacho *t);
+
+/**
+ * @brief The area the last redraw actually changed, in canvas coordinates.
+ *
+ * lv_canvas_finish_layer() invalidates the whole canvas at the end of every
+ * redraw, which on a full-screen canvas means a full-screen flush however
+ * little moved. The display rounder uses this to narrow that area back down
+ * to what was really touched.
+ *
+ * @return false if the whole canvas changed and no narrowing is valid.
+ */
+bool tacho_dirty_span(lv_area_t *out);
 
 #endif /* TACHO_H_ */

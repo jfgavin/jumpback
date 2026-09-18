@@ -30,4 +30,16 @@ config ST7306_WAVESHARE_CONV_BUFFER_STRIPS
 
 endif # ST7306_WAVESHARE
 
+config JUMPBACK_FPS_COUNTER
+	bool "Report achieved frame rate on the heartbeat"
+	default n
+	help
+	  Fold a frame counter and a render-time average into the existing
+	  once-per-second heartbeat, so the console reports what the display
+	  pipeline is actually achieving.
+
+	  Off by default: it costs two k_uptime_get() calls per frame and
+	  widens the heartbeat line, neither of which is wanted in a normal
+	  build. Turn it on when changing anything in the draw or flush path.
+
 source "Kconfig.zephyr"

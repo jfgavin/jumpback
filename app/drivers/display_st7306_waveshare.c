@@ -381,6 +381,27 @@ static int st7306_configure(const struct device *dev)
 }
 
 /*
+ * One write window, in both coordinate systems.
+ *
+ * The caller works in landscape coordinates; the controller is addressed in
+ * panel ones. Resolving both once keeps the rotation loop free of the
+ * conversion and gives st7306_write() a single place to validate alignment.
+ *
+ *   lx1..lx2   landscape X span, which maps to panel ROWS
+ *   ly1        first landscape row, which maps to the LAST panel column
+ *   lw, lh     landscape width and height of the band
+ *   px1        first panel column the band covers
+ */
+struct st7306_window {
+	uint32_t lx1;
+	uint32_t lx2;
+	uint32_t ly1;
+	uint32_t lw;
+	uint32_t lh;
+	uint32_t px1;
+};
+
+/*
  * Rotate one horizontal band of the landscape framebuffer into the
  * controller's native layout.
  *
@@ -422,17 +443,23 @@ static int st7306_configure(const struct device *dev)
  * buffer, i.e. how many pairs of panel rows are ready to send.
  */
 static uint32_t st7306_rotate_strips(const struct device *dev, const uint8_t *src,
-				     uint32_t first_strip, uint32_t max_strips)
+				     const struct st7306_window *win, uint32_t first_strip,
+				     uint32_t max_strips)
 {
 	const struct st7306_config *config = dev->config;
-	const uint32_t src_stride = LANDSCAPE_W / 8;
+	/*
+	 * Source rows are the caller's band, not the whole screen, so the
+	 * stride is the band's width rather than LANDSCAPE_W.
+	 */
+	const uint32_t src_stride = win->lw / 8;
+	const uint32_t strip_bytes = (win->lh * ST7306_PIXELS_PER_ROW_ADDR) / 8;
 	uint32_t strips = 0;
 
 	for (; strips < max_strips; strips++) {
-		const uint32_t py = (first_strip + strips) * ST7306_PIXELS_PER_ROW_ADDR;
-		uint8_t *dst = &config->conversion_buf[strips * PANEL_STRIP_BYTES];
+		const uint32_t py = win->lx1 + (first_strip + strips) * ST7306_PIXELS_PER_ROW_ADDR;
+		uint8_t *dst = &config->conversion_buf[strips * strip_bytes];
 
-		if (py >= PANEL_H) {
+		if (py > win->lx2) {
 			break;
 		}
 
@@ -442,18 +469,28 @@ static uint32_t st7306_rotate_strips(const struct device *dev, const uint8_t *sr
 		 * and lx = py + 1. Walking px across the panel walks ly back
 		 * up the landscape image.
 		 */
-		const uint32_t lx_top = py;
-		const uint32_t lx_bot = py + 1;
+		const uint32_t lx_top = py - win->lx1;
+		const uint32_t lx_bot = lx_top + 1;
 		const uint8_t top_mask = 0x80U >> (lx_top % 8);
 		const uint8_t bot_mask = 0x80U >> (lx_bot % 8);
 		const uint32_t top_byte = lx_top / 8;
 		const uint32_t bot_byte = lx_bot / 8;
 
-		memset(dst, 0, PANEL_STRIP_BYTES);
+		memset(dst, 0, strip_bytes);
 
-		for (uint32_t px = 0; px < PANEL_W; px++) {
-			const uint32_t ly = (LANDSCAPE_H - 1) - px;
-			const uint8_t *row = &src[ly * src_stride];
+		/*
+		 * i walks the band's own column addresses, and the rotation
+		 * makes the band's LAST landscape row the first column the
+		 * controller consumes - hence the descending read.
+		 *
+		 * Band-local throughout: `src` holds only this band, so the
+		 * index is an offset within it and never refers to absolute
+		 * landscape coordinates. Where the band lands on the glass is
+		 * decided once, by win.px1 and the column address window, not
+		 * here.
+		 */
+		for (uint32_t i = 0; i < win->lh; i++) {
+			const uint8_t *row = &src[(win->lh - 1 - i) * src_stride];
 			uint8_t bits = 0;
 
 			/*
@@ -477,7 +514,7 @@ static uint32_t st7306_rotate_strips(const struct device *dev, const uint8_t *sr
 			 * as a skew across the width rather than as an obvious
 			 * flip.
 			 */
-			const uint32_t shift = 6U - 2U * (px % 4);
+			const uint32_t shift = 6U - 2U * (i % 4);
 
 			if (row[top_byte] & top_mask) {
 				bits |= 0x2;
@@ -486,7 +523,7 @@ static uint32_t st7306_rotate_strips(const struct device *dev, const uint8_t *sr
 				bits |= 0x1;
 			}
 
-			dst[px / 4] |= bits << shift;
+			dst[i / 4] |= bits << shift;
 		}
 	}
 
@@ -517,35 +554,102 @@ static int st7306_write(const struct device *dev, const uint16_t x, const uint16
 	}
 
 	/*
-	 * Only full-frame updates are accepted.
+	 * Alignment, in landscape terms.
 	 *
-	 * A partial landscape area maps to a partial panel area whose column
-	 * span must still land on 12-pixel boundaries, and the driver reports
-	 * SCREEN_INFO_X_ALIGNMENT_WIDTH so that Zephyr's mono rounder widens
-	 * every invalidated area to the full width. Combined with
-	 * CONFIG_LV_Z_FULL_REFRESH the flush is always the whole screen, so
-	 * rejecting anything else keeps one addressing path instead of two.
+	 * The rotation maps a landscape X span onto panel rows and a landscape
+	 * Y span onto panel columns, so the controller's two addressing units
+	 * land on different axes:
+	 *
+	 *   landscape X -> panel rows, 2 pixels per row address
+	 *   landscape Y -> panel columns, 12 pixels per column address
+	 *
+	 * Since LANDSCAPE_H is itself a multiple of 12, the Y condition works
+	 * out to y starting on a multiple of 12 and the span ending one short
+	 * of one. The application's rounder produces exactly this; anything
+	 * else is a bug there rather than something to paper over here.
 	 */
-	if (x != 0 || y != 0 || desc->width != LANDSCAPE_W || desc->height != LANDSCAPE_H) {
-		LOG_ERR("Only full-frame writes are supported (got %ux%u at %u,%u, expected %ux%u "
-			"at 0,0)",
-			desc->width, desc->height, x, y, LANDSCAPE_W, LANDSCAPE_H);
-		return -ENOTSUP;
+	/*
+	 * X must be a whole number of bytes, not merely a multiple of the
+	 * controller's 2-pixel row unit.
+	 *
+	 * A landscape X span is the packed axis of the incoming 1bpp band:
+	 * Zephyr's mono glue writes it with `y * width / 8` and the gather
+	 * below reads it back the same way, so a width that is not a multiple
+	 * of 8 truncates the row stride and every row after the first comes
+	 * from the wrong offset. The window would still be addressed
+	 * correctly, so it shows up as garbage inside a correctly placed
+	 * band rather than as a misplaced one.
+	 */
+	if (x % 8 != 0 || desc->width % 8 != 0) {
+		LOG_ERR("X span %u..%u must align to 8 (whole bytes)", x, x + desc->width - 1);
+		return -EINVAL;
 	}
 
-	if (desc->buf_size < (LANDSCAPE_W * LANDSCAPE_H) / 8) {
+	BUILD_ASSERT(8 % ST7306_PIXELS_PER_ROW_ADDR == 0,
+		     "Byte alignment must also satisfy the row address unit");
+
+	if (y % ST7306_PIXELS_PER_COL_ADDR != 0 ||
+	    desc->height % ST7306_PIXELS_PER_COL_ADDR != 0) {
+		LOG_ERR("Y span %u..%u must align to %u", y, y + desc->height - 1,
+			ST7306_PIXELS_PER_COL_ADDR);
+		return -EINVAL;
+	}
+
+	if (x + desc->width > LANDSCAPE_W || y + desc->height > LANDSCAPE_H) {
+		LOG_ERR("Window %ux%u at %u,%u exceeds %ux%u", desc->width, desc->height, x, y,
+			LANDSCAPE_W, LANDSCAPE_H);
+		return -EINVAL;
+	}
+
+	if (desc->buf_size < (desc->width * desc->height) / 8) {
 		LOG_ERR("Display buffer too small (%u)", desc->buf_size);
 		return -EINVAL;
 	}
 
-	/* Address the whole panel: the full column and row range. */
+	const struct st7306_window win = {
+		.lx1 = x,
+		.lx2 = x + desc->width - 1,
+		.ly1 = y,
+		.lw = desc->width,
+		.lh = desc->height,
+		/*
+		 * Where the band sits in the controller's column space.
+		 *
+		 * Not (LANDSCAPE_H - 1) - (y + height - 1), which is the
+		 * unmirrored position. MADCTL bit 6 (MX) is set in
+		 * remap-value, so the controller scans the column address
+		 * window in the opposite direction and a window programmed at
+		 * address A appears mirrored about the full glass span. The
+		 * address to program is therefore the band's own landscape
+		 * offset.
+		 *
+		 * A full-screen window is symmetric about that span, so both
+		 * expressions give 0 for it and the whole-frame path cannot
+		 * tell them apart. That is why this only ever showed up once
+		 * partial bands existed, as redraws mirrored in y against a
+		 * correct background.
+		 */
+		.px1 = y,
+	};
+
+	/*
+	 * Bytes one row address consumes for this band: a strip is 2 panel
+	 * rows wide in the panel's own terms, spanning the band's panel
+	 * columns, which is its landscape height.
+	 */
+	const uint32_t strip_bytes = (win.lh * ST7306_PIXELS_PER_ROW_ADDR) / 8;
+
+	/*
+	 * Address only the band. Column addresses count panel columns from the
+	 * glass origin, so the devicetree's start-column offset still applies.
+	 */
 	const uint8_t col_addrs[] = {
-		config->start_column / ST7306_PIXELS_PER_COL_ADDR,
-		(config->start_column + PANEL_W) / ST7306_PIXELS_PER_COL_ADDR - 1,
+		(config->start_column + win.px1) / ST7306_PIXELS_PER_COL_ADDR,
+		(config->start_column + win.px1 + win.lh) / ST7306_PIXELS_PER_COL_ADDR - 1,
 	};
 	const uint8_t row_addrs[] = {
-		0,
-		PANEL_H / ST7306_PIXELS_PER_ROW_ADDR - 1,
+		win.lx1 / ST7306_PIXELS_PER_ROW_ADDR,
+		(win.lx2 + 1) / ST7306_PIXELS_PER_ROW_ADDR - 1,
 	};
 
 	err = st7306_cmd(dev, ST7306_SET_COLUMN_ADDR, col_addrs, 2);
@@ -563,18 +667,24 @@ static int st7306_write(const struct device *dev, const uint16_t x, const uint16
 		return err;
 	}
 
-	total_strips = PANEL_H / ST7306_PIXELS_PER_ROW_ADDR;
+	/* Panel rows this band covers, i.e. its landscape width. */
+	total_strips = win.lw / ST7306_PIXELS_PER_ROW_ADDR;
 
 	/*
 	 * Convert and send in chunks that fit the conversion buffer, so the
 	 * driver never needs a second full framebuffer.
 	 */
 	while (strip < total_strips) {
-		const uint32_t max_strips = config->conversion_buf_size / PANEL_STRIP_BYTES;
+		const uint32_t max_strips = config->conversion_buf_size / strip_bytes;
 		struct display_buffer_descriptor mipi_desc = { 0 };
 		uint32_t done;
 
-		done = st7306_rotate_strips(dev, src, strip, max_strips);
+		if (max_strips == 0) {
+			LOG_ERR("Conversion buffer too small for a %u-pixel-tall band", win.lh);
+			return -ENOMEM;
+		}
+
+		done = st7306_rotate_strips(dev, src, &win, strip, max_strips);
 		if (done == 0) {
 			LOG_ERR("Conversion made no progress");
 			return -EIO;
@@ -584,12 +694,13 @@ static int st7306_write(const struct device *dev, const uint16_t x, const uint16
 
 		/*
 		 * The descriptor describes the data as the panel sees it: a
-		 * PANEL_W-wide block of (done * 2) panel rows.
+		 * block win.lh panel columns wide and (done * 2) panel rows
+		 * tall.
 		 */
-		mipi_desc.buf_size = done * PANEL_STRIP_BYTES;
-		mipi_desc.width = PANEL_W;
+		mipi_desc.buf_size = done * strip_bytes;
+		mipi_desc.width = win.lh;
 		mipi_desc.height = done * ST7306_PIXELS_PER_ROW_ADDR;
-		mipi_desc.pitch = PANEL_W;
+		mipi_desc.pitch = win.lh;
 		mipi_desc.frame_incomplete = (strip < total_strips);
 
 		err = mipi_dbi_write_display(config->mipi_dev, &config->dbi_config,
@@ -614,39 +725,24 @@ static void st7306_get_capabilities(const struct device *dev, struct display_cap
 	caps->current_pixel_format = PIXEL_FORMAT_MONO01;
 
 	/*
-	 * Ask Zephyr's mono rounder for full-width areas.
+	 * No SCREEN_INFO_X_ALIGNMENT_WIDTH here, deliberately.
 	 *
-	 * The generic rounder aligns with a bitmask (x1 &= ~(w - 1)), which is
-	 * only correct for power-of-two widths; this controller's 12-pixel
-	 * unit is not one, so that path emits unaligned coordinates. Declaring
-	 * an X alignment requirement makes lvgl_rounder_cb_mono() take its
-	 * first branch instead and set the area to the full display width,
-	 * which is always correctly aligned.
+	 * That flag makes lvgl_rounder_cb_mono() widen every invalidated area
+	 * to the full display width, which combined with a full-refresh buffer
+	 * meant every flush was the whole 400x300 screen - 120000 pixels
+	 * repacked by the glue and rotated by this driver, whatever had
+	 * actually changed.
+	 *
+	 * The alignment this controller needs cannot be expressed through that
+	 * interface anyway. Zephyr's rounder aligns with power-of-two bitmasks,
+	 * and after the 90-degree rotation the real constraint is that a
+	 * landscape Y span must align to the 12-pixel column-address unit,
+	 * which is not a power of two. The application supplies its own rounder
+	 * instead (see ui_round_area() and its use in main.c), and this driver
+	 * validates what arrives.
 	 */
-	/*
-	 * SCREEN_INFO_MONO_MSB_FIRST is essential, not cosmetic.
-	 *
-	 * Zephyr's mono LVGL glue repacks the frame before handing it over, and
-	 * lvgl_display_mono.c's set_px_at_pos() picks the destination bit from
-	 * this flag:
-	 *
-	 *     if (caps->screen_info & SCREEN_INFO_MONO_MSB_FIRST)
-	 *             bit = 7 - x % 8;
-	 *     else
-	 *             bit = x % 8;
-	 *
-	 * Without the flag it packs each byte LSB-first, reversing the pixel
-	 * order inside every group of 8 while leaving the groups themselves in
-	 * place. On the glass that shows up as the image being sliced into
-	 * 8-pixel bands with each band mirrored - a tear every 8 pixels rather
-	 * than a whole-image flip, which is what makes it look like a stride
-	 * bug instead of a bit-order one.
-	 *
-	 * This driver reads source pixels MSB-first (0x80 >> (lx % 8)), which
-	 * is also how LVGL itself stores I1, so the flag simply tells the glue
-	 * to leave that convention alone.
-	 */
-	caps->screen_info = SCREEN_INFO_X_ALIGNMENT_WIDTH | SCREEN_INFO_MONO_MSB_FIRST;
+
+	caps->screen_info = SCREEN_INFO_MONO_MSB_FIRST;
 }
 
 static int st7306_set_pixel_format(const struct device *dev, const enum display_pixel_format pf)
