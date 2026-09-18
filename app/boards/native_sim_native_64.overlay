@@ -1,10 +1,37 @@
 /*
  * Copyright (c) 2026 Josh Gav
  *
- * Display geometry for the host build.
+ * Display geometry and format for the host build.
  */
 
+#include <zephyr/dt-bindings/display/panel.h>
+
 &sdl_dc {
-	width = <320>;
-	height = <240>;
+	width = <400>;
+	height = <300>;
+
+	/*
+	 * Match the reflective LCD the app actually targets: 1 bit per pixel,
+	 * and the same bit sense the ST7306 driver reports - MONO01, a set bit
+	 * meaning lit.
+	 *
+	 * The board's own default here is ARGB_8888, and leaving it that way
+	 * segfaults rather than merely looking wrong. LVGL takes its render
+	 * format from the display's reported pixel format - so ARGB_8888 makes
+	 * it blend 4 bytes per pixel - while the Zephyr glue sizes the draw
+	 * buffer from CONFIG_LV_Z_BITS_PER_PIXEL, which follows LV_COLOR_DEPTH
+	 * and so was 2 bytes per pixel. Every full-screen fill then wrote twice
+	 * the bytes the buffer held.
+	 *
+	 * CONFIG_LV_Z_FULL_REFRESH is what turned that latent mismatch into a
+	 * crash on the first frame: it pins the buffer to a whole screen rather
+	 * than a small slice, so the very first background fill runs off the
+	 * end.
+	 *
+	 * MONO01 matches st7306_get_capabilities(), which reports
+	 * PIXEL_FORMAT_MONO01 for the real panel. Both ends of the pipeline then
+	 * agree on bit sense, so the simulator and the glass render identically
+	 * rather than as each other's negative.
+	 */
+	pixel-format = <PANEL_PIXEL_FORMAT_MONO01>;
 };
