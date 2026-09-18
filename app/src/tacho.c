@@ -39,6 +39,9 @@
 
 #define NORMAL_UNIT 1024
 
+#define I1_INDEX_0_FILL 0x00
+#define I1_INDEX_1_FILL 0xff
+
 struct track_point {
 	lv_point_t point;
 	int32_t normal_x;
@@ -199,12 +202,45 @@ static void draw_ticks(const struct tacho *t, lv_layer_t *layer, const lv_point_
 	}
 }
 
+#if LV_COLOR_DEPTH == 1
+static uint8_t i1_fill_byte(lv_color_t color)
+{
+	const bool is_index_1 = lv_color_luminance(color) > LV_DRAW_SW_I1_LUM_THRESHOLD;
+
+	return is_index_1 ? I1_INDEX_1_FILL : I1_INDEX_0_FILL;
+}
+
+static void canvas_clear(lv_obj_t *canvas, lv_color_t color)
+{
+	lv_draw_buf_t *draw_buf = lv_canvas_get_draw_buf(canvas);
+	uint8_t *pixels;
+
+	if (draw_buf == NULL) {
+		return;
+	}
+
+	pixels = lv_draw_buf_goto_xy(draw_buf, 0, 0);
+	if (pixels == NULL) {
+		return;
+	}
+
+	lv_memset(pixels, i1_fill_byte(color), draw_buf->header.stride * draw_buf->header.h);
+	lv_draw_buf_flush_cache(draw_buf, NULL);
+	lv_obj_invalidate(canvas);
+}
+#else
+static void canvas_clear(lv_obj_t *canvas, lv_color_t color)
+{
+	lv_canvas_fill_bg(canvas, color, LV_OPA_COVER);
+}
+#endif
+
 static void tacho_render(const struct tacho *t, const lv_point_precise_t *pts, int32_t total)
 {
 	lv_layer_t layer;
 	lv_draw_line_dsc_t dsc;
 
-	lv_canvas_fill_bg(t->canvas, lv_color_hex(UI_COLOR_BG), LV_OPA_COVER);
+	canvas_clear(t->canvas, lv_color_hex(UI_COLOR_BG));
 	lv_canvas_init_layer(t->canvas, &layer);
 
 	lv_draw_line_dsc_init(&dsc);
