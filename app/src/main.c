@@ -24,7 +24,8 @@ LOG_MODULE_REGISTER(app, LOG_LEVEL_INF);
 #define FRAME_INTERVAL_MS 20
 
 /*
- * How long the needle takes to sweep the full range, in milliseconds.
+ * How long the needle takes to cross the full range, in milliseconds. One
+ * complete up-and-back cycle is twice this.
  *
  * The sweep is defined in time rather than in RPM-per-frame so it runs at the
  * same speed everywhere. Deriving the step from the frame rate instead ties
@@ -152,8 +153,25 @@ int main(void)
 		 * positions rather than sweeping more slowly.
 		 */
 		int64_t elapsed = k_uptime_get() - start;
-		int32_t phase = (int32_t)(elapsed % SWEEP_PERIOD_MS);
-		int32_t rpm = (int32_t)(((int64_t)phase * rpm_max) / SWEEP_PERIOD_MS);
+		int32_t phase = (int32_t)(elapsed % (2 * SWEEP_PERIOD_MS));
+		int32_t rpm;
+
+		/*
+		 * Sweep up and then back down, rather than snapping from full
+		 * scale to zero.
+		 *
+		 * A sawtooth costs a full-screen flush once per cycle: the
+		 * needle jumps the whole range in one frame, so the span
+		 * between the old and new fill ends is the entire track and
+		 * the dirty rectangle covers the panel. Reversing keeps every
+		 * step small, so every frame stays a narrow band - and it
+		 * reads better on the glass than a snap back.
+		 */
+		if (phase >= SWEEP_PERIOD_MS) {
+			phase = 2 * SWEEP_PERIOD_MS - phase;
+		}
+
+		rpm = (int32_t)(((int64_t)phase * rpm_max) / SWEEP_PERIOD_MS);
 
 		tacho_set_rpm(&tacho, rpm);
 
