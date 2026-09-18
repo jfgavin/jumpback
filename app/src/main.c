@@ -11,13 +11,33 @@ LOG_MODULE_REGISTER(app, LOG_LEVEL_INF);
 
 /*
  * Frame period. The panel's high-power waveform tops out near 51Hz, so ~20ms
- * is the floor that the glass can actually show; the RPM step below is what
- * governs how fast the needle sweeps.
+ * is the floor that the glass can actually show.
+ *
+ * This is a target period, not a delay: the loop below sleeps until the next
+ * multiple of it rather than sleeping for it. Sleeping for it would add the
+ * render time to every frame, which is what made the sweep run at different
+ * speeds on different platforms - the host renders a frame in a few
+ * milliseconds while the board spends far longer packing and clocking 15000
+ * bytes out over SPI, so the same k_msleep() produced 30ms frames in the
+ * simulator and much slower ones on the glass.
  */
 #define FRAME_INTERVAL_MS 20
 
-/* RPM added per frame. Larger steps make the sweep visibly faster. */
-#define RPM_STEP 300
+/*
+ * How long the needle takes to sweep the full range, in milliseconds.
+ *
+ * The sweep is defined in time rather than in RPM-per-frame so it runs at the
+ * same speed everywhere. Deriving the step from the frame rate instead ties
+ * the animation to whatever rate the platform happens to achieve: at a fixed
+ * 300 RPM per frame the gauge crossed its whole range in 26.7 frames, which is
+ * a brisk 0.8s in the simulator and a much slower crawl on hardware, purely
+ * because the two draw at different rates.
+ *
+ * Positions are computed from the elapsed time below, so a platform that
+ * cannot keep up drops frames and still sweeps in this many milliseconds -
+ * it just does so less smoothly.
+ */
+#define SWEEP_PERIOD_MS 3000
 
 /*
  * Model name, drawn straight onto the screen rather than into a widget. Uses
@@ -78,13 +98,23 @@ int main(void)
 		return 0;
 	}
 
-	int rpm = 0;
-	uint32_t frame = 0;
-	while (1) {
-		tacho_set_rpm(&tacho, rpm);
+	const int32_t rpm_max = tacho_get_rpm_max(&tacho);
+	const int64_t start = k_uptime_get();
+	int64_t next_frame = start;
+	int64_t last_log = start;
 
-		rpm += RPM_STEP;
-		if (rpm > tacho_get_rpm_max(&tacho)) rpm = 0;
+	while (1) {
+		/*
+		 * Needle position from elapsed time, so the sweep takes
+		 * SWEEP_PERIOD_MS regardless of how fast this loop turns. A
+		 * platform that renders slowly shows fewer intermediate
+		 * positions rather than sweeping more slowly.
+		 */
+		int64_t elapsed = k_uptime_get() - start;
+		int32_t phase = (int32_t)(elapsed % SWEEP_PERIOD_MS);
+		int32_t rpm = (int32_t)(((int64_t)phase * rpm_max) / SWEEP_PERIOD_MS);
+
+		tacho_set_rpm(&tacho, rpm);
 
 		/*
 		 * Heartbeat. The USB Serial/JTAG console drops anything written
@@ -93,13 +123,33 @@ int main(void)
 		 * long gone by the time a terminal attaches. Logging on a timer
 		 * gives something that arrives after the terminal is up, which
 		 * is what makes "is it running?" answerable at all here.
+		 *
+		 * Timed off the clock rather than counted in frames, for the
+		 * same reason the needle is: a frame count logs at a different
+		 * real-world rate on each platform.
 		 */
-		if (++frame % (1000 / FRAME_INTERVAL_MS) == 0) {
+		if (k_uptime_get() - last_log >= 1000) {
+			last_log = k_uptime_get();
 			LOG_INF("alive: rpm=%d", rpm);
 		}
 
 		lv_timer_handler();
-		k_msleep(FRAME_INTERVAL_MS);
+
+		/*
+		 * Sleep to the next frame boundary rather than for a fixed
+		 * interval, so the render time is absorbed by the wait instead
+		 * of being added to it. If a frame overran its slot, skip the
+		 * boundaries already missed so the loop rejoins the cadence
+		 * instead of accumulating lag.
+		 */
+		next_frame += FRAME_INTERVAL_MS;
+
+		int64_t now = k_uptime_get();
+		if (next_frame <= now) {
+			next_frame = now + FRAME_INTERVAL_MS;
+		} else {
+			k_msleep((int32_t)(next_frame - now));
+		}
 	}
 
 	return 0;
