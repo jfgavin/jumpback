@@ -47,6 +47,15 @@
 			status = "okay";
 			compatible = "waveshare,st7306-landscape";
 			reg = <0>;
+			/*
+			 * SPI clock.
+			 *
+			 * Raising this does not help: the flush is dominated by two
+			 * per-pixel passes - Zephyr's mono repack and this driver's
+			 * software rotation - not by shift time, which is only 12 ms
+			 * of the measured 135 ms even at this conservative rate.
+			 * Tried at 40 MHz with no change to the frame time.
+			 */
 			mipi-max-frequency = <10000000>;
 			mipi-mode = "MIPI_DBI_MODE_SPI_4WIRE";
 

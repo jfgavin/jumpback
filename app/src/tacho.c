@@ -262,6 +262,69 @@ static void draw_ticks(const struct tacho *t, lv_layer_t *layer,
 	}
 }
 
+/*
+ * Clear the canvas to a solid colour.
+ *
+ * lv_canvas_fill_bg() has memset-style fast paths for RGB565, ARGB8888,
+ * RGB888, L8 and AL88, but none for I1 - an indexed format falls through to a
+ * generic loop that calls lv_canvas_set_px() once per pixel, each call
+ * redoing the bounds check, the stride arithmetic and the bit masking. On a
+ * 400x300 canvas that is 120000 calls, measured at 1454 ms per frame on the
+ * ESP32-S3: about 99% of a redraw, and the reason the gauge ran at 0.6 fps
+ * while the display flush itself took only 132 ms.
+ *
+ * A solid fill of a 1bpp buffer is a uniform byte, so it is just a memset.
+ * The colour is reduced to a palette index exactly as LVGL's own I1 blender
+ * does it (see the note on the fill byte below), and the palette set in
+ * tacho_init() maps index 0 to the background and index 1 to the ink.
+ *
+ * Only correct for a full-canvas solid fill, which is all this widget needs;
+ * anything partial or blended still belongs in LVGL's own path.
+ */
+static void canvas_fill_bg_fast(lv_obj_t *canvas, lv_color_t color)
+{
+#if LV_COLOR_DEPTH == 1
+	lv_draw_buf_t *draw_buf = lv_canvas_get_draw_buf(canvas);
+	uint8_t *data;
+	uint8_t fill;
+
+	if (draw_buf == NULL) {
+		return;
+	}
+
+	/*
+	 * Start of the pixel data. For an indexed format the palette sits in
+	 * front of it, and goto_xy() is what knows to step over it.
+	 */
+	data = lv_draw_buf_goto_xy(draw_buf, 0, 0);
+	if (data == NULL) {
+		return;
+	}
+
+	/*
+	 * Palette index per pixel, replicated across the byte.
+	 *
+	 * This has to reduce the colour exactly the way LVGL's own I1 blender
+	 * does, or the cleared background ends up the opposite of everything
+	 * drawn on top of it. lv_draw_sw_blend_to_i1.c computes
+	 *
+	 *     lv_color_luminance(c) / (LV_DRAW_SW_I1_LUM_THRESHOLD + 1)
+	 *
+	 * so white (luminance 255) is index 1 and black index 0 - the same
+	 * sense as the palette set in tacho_init(), where entry 1 is the ink.
+	 * A white background is therefore all-ones, not all-zeroes.
+	 */
+	fill = (lv_color_luminance(color) / (LV_DRAW_SW_I1_LUM_THRESHOLD + 1)) ? 0xff : 0x00;
+
+	lv_memset(data, fill, draw_buf->header.stride * draw_buf->header.h);
+
+	lv_draw_buf_flush_cache(draw_buf, NULL);
+	lv_obj_invalidate(canvas);
+#else
+	lv_canvas_fill_bg(canvas, color, LV_OPA_COVER);
+#endif
+}
+
 static void tacho_redraw(const struct tacho *t)
 {
 	lv_point_precise_t pts[TRACK_PT_CNT];
@@ -272,7 +335,7 @@ static void tacho_redraw(const struct tacho *t)
 	track_points(t, pts);
 	total = track_total_len(pts);
 
-	lv_canvas_fill_bg(t->canvas, lv_color_hex(UI_COLOR_BG), LV_OPA_COVER);
+	canvas_fill_bg_fast(t->canvas, lv_color_hex(UI_COLOR_BG));
 	lv_canvas_init_layer(t->canvas, &layer);
 
 	lv_draw_line_dsc_init(&dsc);
