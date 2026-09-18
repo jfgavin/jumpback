@@ -37,6 +37,9 @@
 #define LABEL_RPM_PER_DIGIT   1000
 #define LABEL_TEXT_LEN        8
 
+#define DIRTY_SLACK 1
+#define DIRTY_PAD   (TRACK_WIDTH / 2 + TICK_HALF_LEN + DIRTY_SLACK)
+
 #define NORMAL_UNIT 1024
 
 #define I1_INDEX_0_FILL 0x00
@@ -47,6 +50,9 @@ struct track_point {
 	int32_t normal_x;
 	int32_t normal_y;
 };
+
+static lv_area_t tacho_dirty;
+static bool tacho_dirty_valid;
 
 static void track_points(const struct tacho *t, lv_point_precise_t pts[TRACK_POINT_COUNT])
 {
@@ -226,7 +232,6 @@ static void canvas_clear(lv_obj_t *canvas, lv_color_t color)
 
 	lv_memset(pixels, i1_fill_byte(color), draw_buf->header.stride * draw_buf->header.h);
 	lv_draw_buf_flush_cache(draw_buf, NULL);
-	lv_obj_invalidate(canvas);
 }
 #else
 static void canvas_clear(lv_obj_t *canvas, lv_color_t color)
@@ -234,6 +239,43 @@ static void canvas_clear(lv_obj_t *canvas, lv_color_t color)
 	lv_canvas_fill_bg(canvas, color, LV_OPA_COVER);
 }
 #endif
+
+bool tacho_dirty_span(lv_area_t *out)
+{
+	if (!tacho_dirty_valid) {
+		return false;
+	}
+
+	*out = tacho_dirty;
+	return true;
+}
+
+static void mark_everything_dirty(const struct tacho *t)
+{
+	tacho_dirty_valid = false;
+	lv_obj_invalidate(t->canvas);
+}
+
+static void mark_fill_change_dirty(const struct tacho *t, const lv_point_precise_t *pts,
+				   int32_t total, int32_t old_rpm, int32_t new_rpm)
+{
+	struct track_point old_end;
+	struct track_point new_end;
+
+	if (!track_point_at(pts, rpm_to_dist(t, old_rpm, total), &old_end) ||
+	    !track_point_at(pts, rpm_to_dist(t, new_rpm, total), &new_end)) {
+		mark_everything_dirty(t);
+		return;
+	}
+
+	tacho_dirty = (lv_area_t){
+		.x1 = MAX(MIN(old_end.point.x, new_end.point.x) - DIRTY_PAD, 0),
+		.y1 = MAX(MIN(old_end.point.y, new_end.point.y) - DIRTY_PAD, 0),
+		.x2 = MIN(MAX(old_end.point.x, new_end.point.x) + DIRTY_PAD, t->cfg.width - 1),
+		.y2 = MIN(MAX(old_end.point.y, new_end.point.y) + DIRTY_PAD, t->cfg.height - 1),
+	};
+	tacho_dirty_valid = true;
+}
 
 static void tacho_render(const struct tacho *t, const lv_point_precise_t *pts, int32_t total)
 {
@@ -328,6 +370,7 @@ int tacho_init(struct tacho *t, lv_obj_t *parent, const struct tacho_config *cfg
 
 	track_points(t, pts);
 	tacho_render(t, pts, track_total_len(pts));
+	mark_everything_dirty(t);
 
 	return 0;
 }
@@ -335,6 +378,7 @@ int tacho_init(struct tacho *t, lv_obj_t *parent, const struct tacho_config *cfg
 void tacho_set_rpm(struct tacho *t, int32_t rpm)
 {
 	lv_point_precise_t pts[TRACK_POINT_COUNT];
+	int32_t total;
 
 	rpm = CLAMP(rpm, t->cfg.rpm_min, t->cfg.rpm_max);
 
@@ -342,10 +386,14 @@ void tacho_set_rpm(struct tacho *t, int32_t rpm)
 		return;
 	}
 
+	const int32_t old_rpm = t->rpm;
+
 	t->rpm = rpm;
 
 	track_points(t, pts);
-	tacho_render(t, pts, track_total_len(pts));
+	total = track_total_len(pts);
+	tacho_render(t, pts, total);
+	mark_fill_change_dirty(t, pts, total, old_rpm, rpm);
 }
 
 int32_t tacho_get_rpm(const struct tacho *t)

@@ -8,6 +8,7 @@
 #define TACHO_H_
 
 #include <lvgl.h>
+#include <stdbool.h>
 #include <stdint.h>
 
 struct tacho_config {
@@ -45,5 +46,7 @@ void tacho_set_rpm(struct tacho *t, int32_t rpm);
 int32_t tacho_get_rpm(const struct tacho *t);
 
 int32_t tacho_get_rpm_max(const struct tacho *t);
+
+bool tacho_dirty_span(lv_area_t *out);
 
 #endif /* TACHO_H_ */

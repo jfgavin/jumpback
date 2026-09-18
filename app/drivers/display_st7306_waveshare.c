@@ -83,7 +83,6 @@ LOG_MODULE_REGISTER(st7306_waveshare, CONFIG_DISPLAY_LOG_LEVEL);
 #define REMAP_VALUE DT_INST_PROP(0, remap_value)
 
 #define PANEL_STRIP_BYTES ((PANEL_W * ST7306_PIXELS_PER_ROW_ADDR) / BITS_PER_BYTE)
-#define PANEL_STRIPS      (PANEL_H / ST7306_PIXELS_PER_ROW_ADDR)
 
 BUILD_ASSERT(DT_INST_PROP(0, width) == LANDSCAPE_W,
 	     "Node width must be the transpose of panel-height");
@@ -95,8 +94,12 @@ BUILD_ASSERT(PANEL_W % ST7306_PIXELS_PER_COL_ADDR == 0,
 	     "Panel width must be a multiple of the column address unit");
 BUILD_ASSERT(PANEL_H % ST7306_PIXELS_PER_ROW_ADDR == 0,
 	     "Panel height must be a multiple of the row address unit");
+BUILD_ASSERT(BITS_PER_BYTE % ST7306_PIXELS_PER_ROW_ADDR == 0,
+	     "Byte alignment must also satisfy the row address unit");
 BUILD_ASSERT((REMAP_VALUE & ST7306_MADCTL_MV) == 0,
 	     "MV must stay clear: rotation is done in software, in horizontal scan order");
+BUILD_ASSERT((REMAP_VALUE & ST7306_MADCTL_MX) != 0,
+	     "Band placement relies on MX mirroring the column scan");
 
 struct st7306_config {
 	const struct device *mipi_dev;
@@ -131,6 +134,13 @@ struct st7306_command {
 	uint8_t cmd;
 	const uint8_t *data;
 	size_t len;
+};
+
+struct st7306_band {
+	uint32_t x;
+	uint32_t y;
+	uint32_t width;
+	uint32_t height;
 };
 
 static int st7306_cmd(const struct device *dev, uint8_t cmd, const uint8_t *data, size_t len)
@@ -231,27 +241,40 @@ static int st7306_configure(const struct device *dev)
 	return 0;
 }
 
+static uint32_t st7306_strip_bytes(const struct st7306_band *band)
+{
+	return (band->height * ST7306_PIXELS_PER_ROW_ADDR) / BITS_PER_BYTE;
+}
+
+static uint32_t st7306_band_strips(const struct st7306_band *band)
+{
+	return band->width / ST7306_PIXELS_PER_ROW_ADDR;
+}
+
 static uint32_t st7306_rotate_strips(const struct st7306_config *config,
-				     const uint8_t *landscape_frame, uint32_t first_strip,
+				     const uint8_t *landscape_band,
+				     const struct st7306_band *band, uint32_t first_strip,
 				     uint32_t max_strips)
 {
-	const uint32_t landscape_stride = LANDSCAPE_W / BITS_PER_BYTE;
+	const uint32_t landscape_stride = band->width / BITS_PER_BYTE;
+	const uint32_t strip_bytes = st7306_strip_bytes(band);
+	const uint32_t band_strips = st7306_band_strips(band);
 	uint32_t strips = 0;
 
-	for (; strips < max_strips && first_strip + strips < PANEL_STRIPS; strips++) {
+	for (; strips < max_strips && first_strip + strips < band_strips; strips++) {
 		const uint32_t top_x = (first_strip + strips) * ST7306_PIXELS_PER_ROW_ADDR;
 		const uint32_t bottom_x = top_x + 1;
 		const uint32_t top_byte = top_x / BITS_PER_BYTE;
 		const uint32_t bottom_byte = bottom_x / BITS_PER_BYTE;
 		const uint8_t top_mask = MONO_MSB_FIRST_MASK(top_x);
 		const uint8_t bottom_mask = MONO_MSB_FIRST_MASK(bottom_x);
-		uint8_t *strip = &config->conversion_buf[strips * PANEL_STRIP_BYTES];
+		uint8_t *strip = &config->conversion_buf[strips * strip_bytes];
 
-		memset(strip, 0, PANEL_STRIP_BYTES);
+		memset(strip, 0, strip_bytes);
 
-		for (uint32_t panel_column = 0; panel_column < PANEL_W; panel_column++) {
-			const uint32_t landscape_y = LANDSCAPE_H - 1 - panel_column;
-			const uint8_t *landscape_row = &landscape_frame[landscape_y * landscape_stride];
+		for (uint32_t panel_column = 0; panel_column < band->height; panel_column++) {
+			const uint32_t landscape_y = band->height - 1 - panel_column;
+			const uint8_t *landscape_row = &landscape_band[landscape_y * landscape_stride];
 			const uint32_t shift =
 				NATIVE_BLOCK_FIRST_COLUMN_SHIFT -
 				NATIVE_BLOCK_ROWS * (panel_column % NATIVE_BLOCK_COLUMNS);
@@ -271,22 +294,34 @@ static uint32_t st7306_rotate_strips(const struct st7306_config *config,
 	return strips;
 }
 
-static int st7306_check_frame(const uint16_t x, const uint16_t y,
-			      const struct display_buffer_descriptor *desc)
+static int st7306_check_band(const struct st7306_band *band,
+			     const struct display_buffer_descriptor *desc)
 {
 	if (desc->pitch != desc->width) {
 		LOG_ERR("Pitch (%u) must equal width (%u)", desc->pitch, desc->width);
 		return -EINVAL;
 	}
 
-	if (x != 0 || y != 0 || desc->width != LANDSCAPE_W || desc->height != LANDSCAPE_H) {
-		LOG_ERR("Only full-frame writes are supported (got %ux%u at %u,%u, expected %ux%u "
-			"at 0,0)",
-			desc->width, desc->height, x, y, LANDSCAPE_W, LANDSCAPE_H);
-		return -ENOTSUP;
+	if (band->x % BITS_PER_BYTE != 0 || band->width % BITS_PER_BYTE != 0) {
+		LOG_ERR("X span %u..%u must align to %u (whole bytes)", band->x,
+			band->x + band->width - 1, BITS_PER_BYTE);
+		return -EINVAL;
 	}
 
-	if (desc->buf_size < (LANDSCAPE_W * LANDSCAPE_H) / BITS_PER_BYTE) {
+	if (band->y % ST7306_PIXELS_PER_COL_ADDR != 0 ||
+	    band->height % ST7306_PIXELS_PER_COL_ADDR != 0) {
+		LOG_ERR("Y span %u..%u must align to %u", band->y, band->y + band->height - 1,
+			ST7306_PIXELS_PER_COL_ADDR);
+		return -EINVAL;
+	}
+
+	if (band->x + band->width > LANDSCAPE_W || band->y + band->height > LANDSCAPE_H) {
+		LOG_ERR("Window %ux%u at %u,%u exceeds %ux%u", band->width, band->height, band->x,
+			band->y, LANDSCAPE_W, LANDSCAPE_H);
+		return -EINVAL;
+	}
+
+	if (desc->buf_size < (band->width * band->height) / BITS_PER_BYTE) {
 		LOG_ERR("Display buffer too small (%u)", desc->buf_size);
 		return -EINVAL;
 	}
@@ -298,18 +333,15 @@ static int st7306_write(const struct device *dev, const uint16_t x, const uint16
 			const struct display_buffer_descriptor *desc, const void *buf)
 {
 	const struct st7306_config *config = dev->config;
-	const uint32_t strips_per_chunk = config->conversion_buf_size / PANEL_STRIP_BYTES;
-	const uint8_t column_addresses[] = {
-		config->start_column / ST7306_PIXELS_PER_COL_ADDR,
-		(config->start_column + PANEL_W) / ST7306_PIXELS_PER_COL_ADDR - 1,
-	};
-	const uint8_t row_addresses[] = {
-		0,
-		PANEL_STRIPS - 1,
+	const struct st7306_band band = {
+		.x = x,
+		.y = y,
+		.width = desc->width,
+		.height = desc->height,
 	};
 	int err;
 
-	if (desc->width == 0 || desc->height == 0) {
+	if (band.width == 0 || band.height == 0) {
 		return 0;
 	}
 
@@ -318,10 +350,29 @@ static int st7306_write(const struct device *dev, const uint16_t x, const uint16
 		return -EINVAL;
 	}
 
-	err = st7306_check_frame(x, y, desc);
+	err = st7306_check_band(&band, desc);
 	if (err < 0) {
 		return err;
 	}
+
+	const uint32_t strip_bytes = st7306_strip_bytes(&band);
+	const uint32_t band_strips = st7306_band_strips(&band);
+	const uint32_t strips_per_chunk = config->conversion_buf_size / strip_bytes;
+
+	if (strips_per_chunk == 0) {
+		LOG_ERR("Conversion buffer too small for a %u-pixel-tall band", band.height);
+		return -ENOMEM;
+	}
+
+	const uint32_t first_panel_column = config->start_column + band.y;
+	const uint8_t column_addresses[] = {
+		first_panel_column / ST7306_PIXELS_PER_COL_ADDR,
+		(first_panel_column + band.height) / ST7306_PIXELS_PER_COL_ADDR - 1,
+	};
+	const uint8_t row_addresses[] = {
+		band.x / ST7306_PIXELS_PER_ROW_ADDR,
+		(band.x + band.width) / ST7306_PIXELS_PER_ROW_ADDR - 1,
+	};
 
 	err = st7306_cmd(dev, ST7306_SET_COLUMN_ADDR, column_addresses, sizeof(column_addresses));
 	if (err < 0) {
@@ -338,18 +389,18 @@ static int st7306_write(const struct device *dev, const uint16_t x, const uint16
 		return err;
 	}
 
-	for (uint32_t strip = 0; strip < PANEL_STRIPS;) {
+	for (uint32_t strip = 0; strip < band_strips;) {
 		const uint32_t converted =
-			st7306_rotate_strips(config, buf, strip, strips_per_chunk);
+			st7306_rotate_strips(config, buf, &band, strip, strips_per_chunk);
 
 		strip += converted;
 
 		struct display_buffer_descriptor chunk = {
-			.buf_size = converted * PANEL_STRIP_BYTES,
-			.width = PANEL_W,
+			.buf_size = converted * strip_bytes,
+			.width = band.height,
 			.height = converted * ST7306_PIXELS_PER_ROW_ADDR,
-			.pitch = PANEL_W,
-			.frame_incomplete = strip < PANEL_STRIPS,
+			.pitch = band.height,
+			.frame_incomplete = strip < band_strips,
 		};
 
 		err = mipi_dbi_write_display(config->mipi_dev, &config->dbi_config,
@@ -371,7 +422,7 @@ static void st7306_get_capabilities(const struct device *dev, struct display_cap
 	caps->y_resolution = LANDSCAPE_H;
 	caps->supported_pixel_formats = PIXEL_FORMAT_MONO01;
 	caps->current_pixel_format = PIXEL_FORMAT_MONO01;
-	caps->screen_info = SCREEN_INFO_X_ALIGNMENT_WIDTH | SCREEN_INFO_MONO_MSB_FIRST;
+	caps->screen_info = SCREEN_INFO_MONO_MSB_FIRST;
 }
 
 static int st7306_set_pixel_format(const struct device *dev, const enum display_pixel_format pf)

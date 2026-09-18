@@ -24,4 +24,10 @@ config ST7306_WAVESHARE_CONV_BUFFER_STRIPS
 
 endif # ST7306_WAVESHARE
 
+config JUMPBACK_FPS_COUNTER
+	bool "Report achieved frame rate on the heartbeat"
+	help
+	  Add frames per second and average render time to the once-per-second
+	  heartbeat log line.
+
 source "Kconfig.zephyr"
