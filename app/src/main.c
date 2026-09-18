@@ -55,7 +55,11 @@ static void round_area_to_panel_units(lv_event_t *e)
 
 static int32_t sweep_rpm(int64_t elapsed_ms, int32_t rpm_max)
 {
-	const int32_t phase = (int32_t)(elapsed_ms % SWEEP_PERIOD_MS);
+	int32_t phase = (int32_t)(elapsed_ms % (2 * SWEEP_PERIOD_MS));
+
+	if (phase >= SWEEP_PERIOD_MS) {
+		phase = 2 * SWEEP_PERIOD_MS - phase;
+	}
 
 	return (int32_t)(((int64_t)phase * rpm_max) / SWEEP_PERIOD_MS);
 }
