@@ -47,6 +47,8 @@ int32_t tacho_get_rpm(const struct tacho *t);
 
 int32_t tacho_get_rpm_max(const struct tacho *t);
 
+void tacho_add_dirty(const lv_area_t *area);
+
 bool tacho_dirty_span(lv_area_t *out);
 
 #endif /* TACHO_H_ */

@@ -10,6 +10,8 @@ project(jumpback)
 target_sources(app PRIVATE
 	src/main.c
 	src/tacho.c
+	src/speed.c
+	src/speedo.c
 )
 
 target_sources_ifdef(CONFIG_ST7306_WAVESHARE app PRIVATE

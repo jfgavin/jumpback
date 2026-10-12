@@ -10,6 +10,8 @@
 #include <zephyr/sys/util.h>
 #include <lvgl.h>
 
+#include "speed.h"
+#include "speedo.h"
 #include "tacho.h"
 #include "ui.h"
 
@@ -18,6 +20,7 @@ LOG_MODULE_REGISTER(app, LOG_LEVEL_INF);
 
 #define FRAME_INTERVAL_MS     20
 #define SWEEP_PERIOD_MS       3000
+#define SPEED_STALE_MS        3500
 #define HEARTBEAT_INTERVAL_MS 1000
 
 #define TENTHS_PER_UNIT 10U
@@ -64,7 +67,17 @@ static int32_t sweep_rpm(int64_t elapsed_ms, int32_t rpm_max)
 	return (int32_t)(((int64_t)phase * rpm_max) / SWEEP_PERIOD_MS);
 }
 
-static void log_heartbeat(int32_t rpm, const struct frame_stats *stats, int64_t window_ms)
+static void current_speed(struct speed_reading *reading)
+{
+	speed_get(reading);
+
+	if (reading->valid && k_uptime_get() - reading->timestamp_ms > SPEED_STALE_MS) {
+		reading->valid = false;
+	}
+}
+
+static void log_heartbeat(int32_t rpm, const struct speed_reading *reading,
+			  const struct frame_stats *stats, int64_t window_ms)
 {
 #ifdef CONFIG_JUMPBACK_FPS_COUNTER
 	const uint32_t fps_tenths =
@@ -81,7 +94,13 @@ static void log_heartbeat(int32_t rpm, const struct frame_stats *stats, int64_t 
 	const char *frame_rate = "";
 #endif
 
-	LOG_INF("alive: rpm=%d%s", rpm, frame_rate);
+	if (reading->valid) {
+		LOG_INF("alive: rpm=%d | %u.%u mph%s", rpm, reading->mph_tenths / TENTHS_PER_UNIT,
+			reading->mph_tenths % TENTHS_PER_UNIT, frame_rate);
+	} else {
+		LOG_INF("alive: rpm=%d | --- mph (sats=%u msgs=%u)%s", rpm,
+			(unsigned int)reading->satellites, reading->msg_count, frame_rate);
+	}
 }
 
 static void sleep_until_next_frame(int64_t *next_frame)
@@ -101,6 +120,7 @@ int main(void)
 {
 	const struct device *display_dev = DEVICE_DT_GET(DT_CHOSEN(zephyr_display));
 	static struct tacho tacho;
+	static struct speedo speedo;
 	static uint8_t tacho_buf[TACHO_BUF_SIZE(UI_GAUGE_W, UI_GAUGE_H)];
 	lv_obj_t *screen;
 	int err;
@@ -128,6 +148,17 @@ int main(void)
 		return 0;
 	}
 
+	err = speedo_init(&speedo, screen);
+	if (err) {
+		LOG_ERR("Speedo init failed (%d)", err);
+		return 0;
+	}
+
+	err = speed_init();
+	if (err) {
+		LOG_WRN("Speed source unavailable (%d); readout will show no fix", err);
+	}
+
 	const int32_t rpm_max = tacho_get_rpm_max(&tacho);
 	const int64_t start = k_uptime_get();
 	int64_t next_frame = start;
@@ -136,8 +167,12 @@ int main(void)
 
 	while (true) {
 		const int32_t rpm = sweep_rpm(k_uptime_get() - start, rpm_max);
+		struct speed_reading reading;
 
 		tacho_set_rpm(&tacho, rpm);
+
+		current_speed(&reading);
+		speedo_update(&speedo, reading.mph_tenths, reading.valid);
 
 		const int64_t render_start = k_uptime_get();
 
@@ -150,7 +185,7 @@ int main(void)
 
 		if (since_heartbeat >= HEARTBEAT_INTERVAL_MS) {
 			last_heartbeat = k_uptime_get();
-			log_heartbeat(rpm, &stats, since_heartbeat);
+			log_heartbeat(rpm, &reading, &stats, since_heartbeat);
 			stats = (struct frame_stats){0};
 		}
 

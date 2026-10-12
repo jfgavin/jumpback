@@ -54,6 +54,9 @@ struct track_point {
 static lv_area_t tacho_dirty;
 static bool tacho_dirty_valid;
 
+static lv_area_t tacho_extra;
+static bool tacho_extra_valid;
+
 static void track_points(const struct tacho *t, lv_point_precise_t pts[TRACK_POINT_COUNT])
 {
 	const int32_t w = t->cfg.width;
@@ -240,13 +243,42 @@ static void canvas_clear(lv_obj_t *canvas, lv_color_t color)
 }
 #endif
 
+static void area_union(lv_area_t *into, const lv_area_t *other)
+{
+	into->x1 = MIN(into->x1, other->x1);
+	into->y1 = MIN(into->y1, other->y1);
+	into->x2 = MAX(into->x2, other->x2);
+	into->y2 = MAX(into->y2, other->y2);
+}
+
+void tacho_add_dirty(const lv_area_t *area)
+{
+	if (!tacho_extra_valid) {
+		tacho_extra = *area;
+		tacho_extra_valid = true;
+		return;
+	}
+
+	area_union(&tacho_extra, area);
+}
+
 bool tacho_dirty_span(lv_area_t *out)
 {
+	const bool have_extra = tacho_extra_valid;
+	const lv_area_t extra = tacho_extra;
+
+	tacho_extra_valid = false;
+
 	if (!tacho_dirty_valid) {
 		return false;
 	}
 
 	*out = tacho_dirty;
+
+	if (have_extra) {
+		area_union(out, &extra);
+	}
+
 	return true;
 }
 

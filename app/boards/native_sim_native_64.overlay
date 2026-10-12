@@ -11,3 +11,14 @@
 	height = <300>;
 	pixel-format = <PANEL_PIXEL_FORMAT_MONO01>;
 };
+
+/ {
+	gnss: gnss-emul {
+		compatible = "zephyr,gnss-emul";
+		status = "okay";
+	};
+
+	aliases {
+		gnss = &gnss;
+	};
+};
