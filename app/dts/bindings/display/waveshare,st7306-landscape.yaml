@@ -4,23 +4,12 @@
 title: ST7306 landscape display on the Waveshare ESP32-S3-RLCD-4.2
 
 description: |
-  Landscape (400x300) driver for the reflective LCD on the Waveshare
-  ESP32-S3-RLCD-4.2.
+  Presents the physically portrait ST7306 panel as a landscape display by
+  rotating the framebuffer in software. width and height are the landscape
+  resolution the application draws into; panel-width and panel-height are the
+  glass in its own portrait orientation, and must be their transpose.
 
-  The panel is physically portrait - the glass is 300 pixels wide by 400 tall -
-  and the ST7306 has no hardware landscape mode, so this driver rotates the
-  framebuffer 90 degrees while converting it to the controller's native format.
-
-  Because the rotation makes width and height mean different things to the
-  application and to the panel, both are described: width and height (from
-  display-controller.yaml) are the landscape dimensions the application draws
-  into, and panel-width and panel-height are the physical glass in its own
-  portrait orientation. They are each other's transpose, and the driver
-  asserts as much at build time.
-
-  Keeping the standard width and height properties means code that reads the
-  chosen display node - the app's ui.h, for one - sees the resolution it
-  actually draws into without knowing the panel is rotated.
+  Register field values are named in dt-bindings/display/st7306.h.
 
 compatible: "waveshare,st7306-landscape"
 
@@ -30,127 +19,99 @@ properties:
   panel-width:
     type: int
     required: true
-    description: |
-      Physical width of the glass in pixels, in the panel's own portrait
-      orientation. Must be a multiple of 12, the controller's column address
-      unit, and must equal the height property.
+    description: Portrait glass width in pixels. Multiple of ST7306_PIXELS_PER_COL_ADDR.
 
   panel-height:
     type: int
     required: true
-    description: |
-      Physical height of the glass in pixels, in the panel's own portrait
-      orientation. Must be a multiple of 2, the controller's row address unit,
-      and a multiple of 8 so that a packed 1bpp landscape row is a whole
-      number of bytes. Must equal the width property.
+    description: Portrait glass height in pixels. Multiple of 8.
 
   start-line:
     type: int
     required: true
-    description: Start line (first gate) of display RAM to be displayed.
+    description: First gate line of display RAM shown on the glass.
 
   start-column:
     type: int
     required: true
     description: |
-      Start column of display RAM to be displayed, in pixels. Must be a
-      multiple of 12. This is the offset of the wired glass within the
-      controller's 720-column RAM.
+      First RAM column wired to glass, in pixels. Multiple of
+      ST7306_PIXELS_PER_COL_ADDR.
 
   nvm-load:
     type: uint8-array
     required: true
-    description: NVM load settings, 2 bytes.
+    description: NVM_LOAD (0xD6) parameters.
 
   gate-voltages:
     type: uint8-array
     required: true
-    description: Gate voltages, 5 bits each, 2 bytes.
+    description: GATE_VOLTAGE (0xC0) parameters.
 
   vsh:
     type: uint8-array
     required: true
-    description: High positive source voltage in each of the 4 modes. Affects contrast.
+    description: VSH (0xC1) high positive source voltage, per mode.
 
   vsl:
     type: uint8-array
     required: true
-    description: Low positive source voltage in each of the 4 modes. Affects contrast.
+    description: VSL (0xC2) low positive source voltage, per mode.
 
   vshn:
     type: uint8-array
     required: true
-    description: High negative source voltage in each of the 4 modes. Affects contrast.
+    description: VSHN (0xC4) high negative source voltage, per mode.
 
   vsln:
     type: uint8-array
     required: true
-    description: Low negative source voltage in each of the 4 modes. Affects contrast.
+    description: VSLN (0xC5) low negative source voltage, per mode.
 
   osc-settings:
     type: int
     required: true
-    description: |
-      Oscillator settings, 1 byte:
-      - [7]: enabled or disabled
-      - [5][2-1]: max framerate, 000 = 51Hz, 111 = 32Hz
+    description: OSC_SETTINGS (0xD8) first parameter. See ST7306_OSC_*.
 
   framerate:
     type: int
     required: true
-    description: |
-      Framerate settings, 1 byte:
-      - [4]: high power mode rate, 0 = 25.5Hz, 1 = 51Hz
-      - [2-0]: low power mode rate, 0:0.25Hz, 1:0.5Hz, 2:1Hz, 3:2Hz, 4:4Hz, 5:8Hz
+    description: FRAMERATE (0xB2). See ST7306_FRAMERATE_*.
 
   multiplex-ratio:
     type: int
     required: true
-    description: Number of gate lines the display uses, divided by 4.
+    description: GATESET (0xB0). Gate lines / ST7306_GATE_LINES_PER_MULTIPLEX_STEP.
 
   source-voltage:
     type: int
     required: true
-    description: |
-      Source voltage set selection [1-0], choosing between the four VSH/VSL
-      entries programmed above.
+    description: VSHLSEL (0xC9) source voltage mode.
 
   remap-value:
     type: int
     required: true
-    description: |
-      MADCTL (0x36) value. Note that bit [5] (MV, page/column order) must stay
-      clear: this driver performs the landscape transform itself and emits data
-      in the controller's horizontal scan order, so the RAM address counter has
-      to keep incrementing along X.
-      - [7]: MY, page address order
-      - [6]: MX, column address order
-      - [3]: DO, data output order
-      - [2]: GS, gate scan order
+    description: MADCTL (0x36). See ST7306_MADCTL_*; MV must be clear and MX set.
 
   panel-settings:
     type: int
     required: true
-    description: |
-      Panel and gate layout:
-      - [6-5]: column dot inversion
-      - [3-2]: gate scan mode
-      - [1-0]: panel layout
+    description: PNLSET (0xB8).
 
   hpm-gate-waveform:
     type: uint8-array
     default: [0xE5, 0xF6, 0x05, 0x46, 0x77, 0x77, 0x77, 0x77, 0x76, 0x45]
-    description: Waveform driving the LCD in high power mode, 10 bytes.
+    description: HPM_GATE_WAVEFORM (0xB3).
 
   lpm-gate-waveform:
     type: uint8-array
     default: [0x05, 0x46, 0x77, 0x77, 0x77, 0x77, 0x76, 0x45]
-    description: Waveform driving the LCD in low power mode, 8 bytes.
+    description: LPM_GATE_WAVEFORM (0xB4).
 
   inversion-on:
     type: boolean
-    description: Turn on display colour inversion.
+    description: Send SET_REVERSE_DISPLAY instead of SET_NORMAL_DISPLAY.
 
   low-power-mode:
     type: boolean
-    description: Use low power mode instead of high power mode.
+    description: Run in low power mode instead of high power mode.

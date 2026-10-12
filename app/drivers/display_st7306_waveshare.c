@@ -2,74 +2,6 @@
  * Copyright (c) 2026 Josh Gav
  *
  * SPDX-License-Identifier: Apache-2.0
- *
- * Landscape display driver for the Waveshare ESP32-S3-RLCD-4.2 (ST7306).
- *
- * === Why this driver exists ===
- *
- * The panel is physically portrait. The ST7306 drives 720 source lines and
- * 480 gate lines, and this board wires 300 sources and 400 gates of them to
- * glass, so the hardware raster is 300 wide by 400 tall. Nothing in the
- * controller can change that: MADCTL's MV bit is documented as "Page/Column
- * Order", and it only selects whether the RAM address counter auto-increments
- * along X or along Y during a write (datasheet 7.4, "vertical addressing mode
- * (MV=1) ... Y-address increments after each byte"). It re-orders the write
- * scan, it does not re-wire sources to gates. There is no hardware landscape
- * mode to switch on, so 400x300 has to be produced by rotating pixels.
- *
- * The rotation cannot live in LVGL either. This board pins LVGL to
- * LV_COLOR_DEPTH_1 (see the board's Kconfig.defconfig), and LVGL 9.6's
- * lv_draw_sw_rotate() implements L8, RGB565, RGB888 and ARGB8888 only - I1
- * falls off the end of the switch and the function returns having written
- * nothing. lv_display_set_rotation() on a 1bpp display therefore yields a
- * blank panel rather than an error, which is worse than not supporting it.
- *
- * So the rotation belongs here, in the one place that already has to walk
- * every pixel: the format conversion.
- *
- * === Why rotating is a win, not just a workaround ===
- *
- * The upstream st730x driver derives its row stride from the display width,
- * which forces the width to be a multiple of both 12 (the controller
- * addresses columns in groups of 12) and 8 (a packed 1bpp row must be a whole
- * number of bytes). 300 is a multiple of 12 but not of 8 - 300/8 = 37.5 bytes
- * - so the portrait configuration has to shrink the width to 288 and abandon
- * the 12 rightmost columns of glass.
- *
- * Rotating swaps which axis carries which constraint, and both then hold
- * exactly:
- *
- *   - The LVGL buffer is 400 wide. 400/8 = 50 bytes per row, exact, so the
- *     packed rows need no padding and no truncation.
- *   - Those 400 logical columns map to the panel's 400 rows, addressed two
- *     at a time: 400/2 = 200 row addresses, exact.
- *   - The 300 logical rows map to the panel's 300 columns, addressed twelve
- *     at a time: 300/12 = 25 column addresses, exact.
- *
- * Landscape uses the entire 300x400 glass with no lost columns.
- *
- * === Relationship to the upstream driver ===
- *
- * This is a separate driver rather than a patch to drivers/display/st730x.c
- * because the rotation changes the meaning of every coordinate in the write
- * path; threading a rotation flag through that file would leave two
- * interleaved addressing schemes in code shared with the ST7305. The register
- * programming below is deliberately the same sequence upstream uses, so the
- * panel is brought up identically - only the geometry differs.
- *
- * === Checked against Waveshare's own driver ===
- *
- * The packed output of st7306_rotate_strips() is byte-for-byte identical to
- * what Waveshare's ESP-IDF driver for this board produces, over a full frame.
- * That driver builds a lookup table (InitLandscapeLUT) mapping each landscape
- * pixel to a byte index and bit mask:
- *
- *     index = (x >> 1) * (height / 4) + ((height - 1 - y) >> 2)
- *     bit   = 7 - ((((height - 1 - y) & 3) << 1) | (x & 1))
- *
- * which is the same rotation and the same 4-column-by-2-row byte layout the
- * loop below writes directly. Its column window (0x2A: 0x12..0x2A) is also
- * where this driver's start-column of 216 comes from.
  */
 
 #define DT_DRV_COMPAT waveshare_st7306_landscape
@@ -78,12 +10,15 @@
 #include <zephyr/drivers/display.h>
 #include <zephyr/drivers/mipi_dbi.h>
 #include <zephyr/kernel.h>
+#include <zephyr/sys/byteorder.h>
+#include <zephyr/sys/util.h>
 #include <string.h>
+
+#include <dt-bindings/display/st7306.h>
 
 #include <zephyr/logging/log.h>
 LOG_MODULE_REGISTER(st7306_waveshare, CONFIG_DISPLAY_LOG_LEVEL);
 
-/* Registers. Names and values follow the ST7306 datasheet section 8.1. */
 #define ST7306_SLEEP_IN              0x10
 #define ST7306_SLEEP_OUT             0x11
 #define ST7306_SET_NORMAL_DISPLAY    0x20
@@ -124,71 +59,56 @@ LOG_MODULE_REGISTER(st7306_waveshare, CONFIG_DISPLAY_LOG_LEVEL);
 #define ST7306_OSC_SETTINGS          0xD8
 #define ST7306_OSC_SETTINGS_BYTE2    0xE9
 
+#define ST7306_NVM_LOAD_LEN          2
+#define ST7306_GATE_VOLTAGES_LEN     2
+#define ST7306_SOURCE_VOLTAGE_MODES  4
 #define ST7306_HPM_GATE_WAVEFORM_LEN 10
 #define ST7306_LPM_GATE_WAVEFORM_LEN 8
 
-/*
- * Controller addressing granularity, in panel pixels.
- *
- * One column address covers 12 panel columns; one row address covers 2 panel
- * rows. A write window must start and end on these boundaries.
- */
-#define ST7306_PIXELS_PER_COL_ADDR 12
-#define ST7306_PIXELS_PER_ROW_ADDR 2
+#define ST7306_RESET_DELAY_MS 100
+#define ST7306_SLEEP_DELAY_MS 100
 
-#define ST7306_RESET_DELAY 100
-#define ST7306_SLEEP_DELAY 100
+#define NATIVE_BLOCK_COLUMNS            4
+#define NATIVE_BLOCK_ROWS               ST7306_PIXELS_PER_ROW_ADDR
+#define NATIVE_BLOCK_FIRST_COLUMN_SHIFT ((NATIVE_BLOCK_COLUMNS - 1) * NATIVE_BLOCK_ROWS)
+#define NATIVE_BLOCK_TOP_ROW_BIT        BIT(1)
+#define NATIVE_BLOCK_BOTTOM_ROW_BIT     BIT(0)
 
-/*
- * Panel geometry, in panel (portrait) orientation. The driver presents the
- * transpose of this to the display API.
- */
-#define PANEL_W DT_INST_PROP(0, panel_width)
-#define PANEL_H DT_INST_PROP(0, panel_height)
+#define MONO_MSB_FIRST_MASK(x) (BIT(BITS_PER_BYTE - 1) >> ((x) % BITS_PER_BYTE))
 
-/*
- * Landscape resolution reported to the application. The devicetree states
- * these too, as the node's width and height, so that code reading the chosen
- * display node sees landscape coordinates; the asserts below tie the two
- * descriptions together so they cannot drift apart.
- */
+#define PANEL_W     DT_INST_PROP(0, panel_width)
+#define PANEL_H     DT_INST_PROP(0, panel_height)
 #define LANDSCAPE_W PANEL_H
 #define LANDSCAPE_H PANEL_W
+#define REMAP_VALUE DT_INST_PROP(0, remap_value)
+
+#define PANEL_STRIP_BYTES ((PANEL_W * ST7306_PIXELS_PER_ROW_ADDR) / BITS_PER_BYTE)
+#define PANEL_STRIPS      (PANEL_H / ST7306_PIXELS_PER_ROW_ADDR)
 
 BUILD_ASSERT(DT_INST_PROP(0, width) == LANDSCAPE_W,
 	     "Node width must be the transpose of panel-height");
 BUILD_ASSERT(DT_INST_PROP(0, height) == LANDSCAPE_H,
 	     "Node height must be the transpose of panel-width");
-
-/*
- * The geometry this driver's addressing math depends on. These are checked
- * rather than assumed because every one of them being exact is the reason
- * landscape can use the full glass (see the header comment).
- */
-BUILD_ASSERT(LANDSCAPE_W % 8 == 0,
+BUILD_ASSERT(LANDSCAPE_W % BITS_PER_BYTE == 0,
 	     "Landscape width must be a whole number of bytes in a packed 1bpp row");
 BUILD_ASSERT(PANEL_W % ST7306_PIXELS_PER_COL_ADDR == 0,
-	     "Panel width must be a multiple of the 12-pixel column address unit");
+	     "Panel width must be a multiple of the column address unit");
 BUILD_ASSERT(PANEL_H % ST7306_PIXELS_PER_ROW_ADDR == 0,
-	     "Panel height must be a multiple of the 2-pixel row address unit");
-
-/*
- * Bytes the controller consumes for one row address, i.e. for a 2-pixel-tall
- * strip spanning the full panel width. Two panel rows at 1 bit per pixel.
- */
-#define PANEL_STRIP_BYTES ((PANEL_W * ST7306_PIXELS_PER_ROW_ADDR) / 8)
+	     "Panel height must be a multiple of the row address unit");
+BUILD_ASSERT((REMAP_VALUE & ST7306_MADCTL_MV) == 0,
+	     "MV must stay clear: rotation is done in software, in horizontal scan order");
 
 struct st7306_config {
 	const struct device *mipi_dev;
 	const struct mipi_dbi_config dbi_config;
 	uint16_t start_line;
 	uint16_t start_column;
-	uint8_t nvm_load[2];
-	uint8_t gate_voltages[2];
-	uint8_t vsh[4];
-	uint8_t vsl[4];
-	uint8_t vshn[4];
-	uint8_t vsln[4];
+	uint8_t nvm_load[ST7306_NVM_LOAD_LEN];
+	uint8_t gate_voltages[ST7306_GATE_VOLTAGES_LEN];
+	uint8_t vsh[ST7306_SOURCE_VOLTAGE_MODES];
+	uint8_t vsl[ST7306_SOURCE_VOLTAGE_MODES];
+	uint8_t vshn[ST7306_SOURCE_VOLTAGE_MODES];
+	uint8_t vsln[ST7306_SOURCE_VOLTAGE_MODES];
 	uint8_t osc_settings;
 	uint8_t framerate;
 	uint8_t multiplex_ratio;
@@ -205,6 +125,12 @@ struct st7306_config {
 
 struct st7306_data {
 	bool blanking_on;
+};
+
+struct st7306_command {
+	uint8_t cmd;
+	const uint8_t *data;
+	size_t len;
 };
 
 static int st7306_cmd(const struct device *dev, uint8_t cmd, const uint8_t *data, size_t len)
@@ -224,7 +150,7 @@ static int st7306_resume(const struct device *dev)
 	if (err < 0) {
 		return err;
 	}
-	k_msleep(ST7306_SLEEP_DELAY);
+	k_msleep(ST7306_SLEEP_DELAY_MS);
 
 	err = st7306_cmd(dev, ST7306_DISPLAY_ON, NULL, 0);
 	if (err < 0) {
@@ -246,263 +172,144 @@ static int st7306_suspend(const struct device *dev)
 	if (err < 0) {
 		return err;
 	}
-	k_msleep(ST7306_SLEEP_DELAY);
+	k_msleep(ST7306_SLEEP_DELAY_MS);
 
 	data->blanking_on = true;
 
 	return mipi_dbi_release(config->mipi_dev, &config->dbi_config);
 }
 
-/*
- * Bring-up sequence.
- *
- * This mirrors the upstream st730x driver's ordering: the analog rails and
- * oscillator are programmed before the gate waveforms, and the panel is left
- * in whichever power mode the devicetree selected. Reordering these is not
- * safe - the booster has to be enabled before the voltages it generates are
- * set, and the gate waveforms are latched against the frame rate.
- */
 static int st7306_configure(const struct device *dev)
 {
 	const struct st7306_config *config = dev->config;
-	uint8_t tmp[2];
-	int err;
+	const uint8_t booster_enable[] = { ST7306_BOOSTER_EN_ENABLE };
+	const uint8_t osc_settings[] = { config->osc_settings, ST7306_OSC_SETTINGS_BYTE2 };
+	const uint8_t source_eq_enable[] = { ST7306_SOURCE_EQ_EN_ENABLE };
+	const uint8_t data_format[] = { ST7306_DTFORM_3W_24B };
+	const uint8_t gamma_mode[] = { ST7306_GAMAMS_MONO };
+	const uint8_t tearing_out[] = { ST7306_TEARING_OUT_VBLANK };
+	const uint8_t auto_power_down[] = { ST7306_AUTOPWRDOWN_ON };
+	uint8_t first_gate[sizeof(uint16_t)];
 
-	struct {
-		uint8_t cmd;
-		const uint8_t *data;
-		size_t len;
-	} const seq[] = {
-		{ ST7306_NVM_LOAD, config->nvm_load, 2 },
-		{ ST7306_BOOSTER_EN, (const uint8_t[]){ ST7306_BOOSTER_EN_ENABLE }, 1 },
-		{ ST7306_GATE_VOLTAGE, config->gate_voltages, 2 },
-		{ ST7306_VSH, config->vsh, 4 },
-		{ ST7306_VSL, config->vsl, 4 },
-		{ ST7306_VSHN, config->vshn, 4 },
-		{ ST7306_VSLN, config->vsln, 4 },
+	sys_put_be16(config->start_line, first_gate);
+
+	const struct st7306_command sequence[] = {
+		{ ST7306_NVM_LOAD, config->nvm_load, sizeof(config->nvm_load) },
+		{ ST7306_BOOSTER_EN, booster_enable, sizeof(booster_enable) },
+		{ ST7306_GATE_VOLTAGE, config->gate_voltages, sizeof(config->gate_voltages) },
+		{ ST7306_VSH, config->vsh, sizeof(config->vsh) },
+		{ ST7306_VSL, config->vsl, sizeof(config->vsl) },
+		{ ST7306_VSHN, config->vshn, sizeof(config->vshn) },
+		{ ST7306_VSLN, config->vsln, sizeof(config->vsln) },
+		{ ST7306_OSC_SETTINGS, osc_settings, sizeof(osc_settings) },
+		{ ST7306_FRAMERATE, &config->framerate, sizeof(config->framerate) },
+		{ ST7306_HPM_GATE_WAVEFORM, config->hpm_gate_waveform,
+		  sizeof(config->hpm_gate_waveform) },
+		{ ST7306_LPM_GATE_WAVEFORM, config->lpm_gate_waveform,
+		  sizeof(config->lpm_gate_waveform) },
+		{ ST7306_SOURCE_EQ_EN, source_eq_enable, sizeof(source_eq_enable) },
+		{ ST7306_GATESET, &config->multiplex_ratio, sizeof(config->multiplex_ratio) },
+		{ ST7306_VSHLSEL, &config->source_voltage, sizeof(config->source_voltage) },
+		{ ST7306_MADCTL, &config->remap_value, sizeof(config->remap_value) },
+		{ ST7306_DTFORM, data_format, sizeof(data_format) },
+		{ ST7306_GAMAMS, gamma_mode, sizeof(gamma_mode) },
+		{ ST7306_PNLSET, &config->panel_settings, sizeof(config->panel_settings) },
+		{ ST7306_TEARING_OUT, tearing_out, sizeof(tearing_out) },
+		{ ST7306_AUTOPWRDOWN, auto_power_down, sizeof(auto_power_down) },
+		{ ST7306_FIRSTGATE, first_gate, sizeof(first_gate) },
+		{ config->low_power_mode ? ST7306_LPM : ST7306_HPM, NULL, 0 },
 	};
 
-	for (size_t i = 0; i < ARRAY_SIZE(seq); i++) {
-		err = st7306_cmd(dev, seq[i].cmd, seq[i].data, seq[i].len);
+	for (size_t i = 0; i < ARRAY_SIZE(sequence); i++) {
+		int err = st7306_cmd(dev, sequence[i].cmd, sequence[i].data, sequence[i].len);
+
 		if (err < 0) {
 			return err;
 		}
 	}
 
-	tmp[0] = config->osc_settings;
-	tmp[1] = ST7306_OSC_SETTINGS_BYTE2;
-	err = st7306_cmd(dev, ST7306_OSC_SETTINGS, tmp, 2);
-	if (err < 0) {
-		return err;
-	}
-
-	err = st7306_cmd(dev, ST7306_FRAMERATE, &config->framerate, 1);
-	if (err < 0) {
-		return err;
-	}
-
-	err = st7306_cmd(dev, ST7306_HPM_GATE_WAVEFORM, config->hpm_gate_waveform,
-			 ST7306_HPM_GATE_WAVEFORM_LEN);
-	if (err < 0) {
-		return err;
-	}
-
-	err = st7306_cmd(dev, ST7306_LPM_GATE_WAVEFORM, config->lpm_gate_waveform,
-			 ST7306_LPM_GATE_WAVEFORM_LEN);
-	if (err < 0) {
-		return err;
-	}
-
-	tmp[0] = ST7306_SOURCE_EQ_EN_ENABLE;
-	err = st7306_cmd(dev, ST7306_SOURCE_EQ_EN, tmp, 1);
-	if (err < 0) {
-		return err;
-	}
-
-	err = st7306_cmd(dev, ST7306_GATESET, &config->multiplex_ratio, 1);
-	if (err < 0) {
-		return err;
-	}
-
-	err = st7306_cmd(dev, ST7306_VSHLSEL, &config->source_voltage, 1);
-	if (err < 0) {
-		return err;
-	}
-
-	/*
-	 * MADCTL. MV stays 0: the write path below emits data in the
-	 * controller's native horizontal scan order and does the landscape
-	 * transform itself, so the address counter must keep incrementing
-	 * along X. The MX/MY/GS bits in remap-value still apply and are how
-	 * the board's mirroring is expressed.
-	 */
-	err = st7306_cmd(dev, ST7306_MADCTL, &config->remap_value, 1);
-	if (err < 0) {
-		return err;
-	}
-
-	tmp[0] = ST7306_DTFORM_3W_24B;
-	err = st7306_cmd(dev, ST7306_DTFORM, tmp, 1);
-	if (err < 0) {
-		return err;
-	}
-
-	tmp[0] = ST7306_GAMAMS_MONO;
-	err = st7306_cmd(dev, ST7306_GAMAMS, tmp, 1);
-	if (err < 0) {
-		return err;
-	}
-
-	err = st7306_cmd(dev, ST7306_PNLSET, &config->panel_settings, 1);
-	if (err < 0) {
-		return err;
-	}
-
-	tmp[0] = ST7306_TEARING_OUT_VBLANK;
-	err = st7306_cmd(dev, ST7306_TEARING_OUT, tmp, 1);
-	if (err < 0) {
-		return err;
-	}
-
-	tmp[0] = ST7306_AUTOPWRDOWN_ON;
-	err = st7306_cmd(dev, ST7306_AUTOPWRDOWN, tmp, 1);
-	if (err < 0) {
-		return err;
-	}
-
-	tmp[0] = (config->start_line & 0x100) >> 8;
-	tmp[1] = config->start_line & 0xFF;
-	err = st7306_cmd(dev, ST7306_FIRSTGATE, tmp, 2);
-	if (err < 0) {
-		return err;
-	}
-
-	return st7306_cmd(dev, config->low_power_mode ? ST7306_LPM : ST7306_HPM, NULL, 0);
+	return 0;
 }
 
-/*
- * Rotate one horizontal band of the landscape framebuffer into the
- * controller's native layout.
- *
- * Coordinates: (lx, ly) are landscape pixels, (px, py) are panel pixels. The
- * image is rotated 90 degrees clockwise onto the glass:
- *
- *     px = (LANDSCAPE_H - 1) - ly
- *     py = lx
- *
- * so a landscape row runs down a panel column, and successive landscape rows
- * walk right-to-left across the panel. Landscape (0,0) lands at the panel's
- * top-right corner, which means the board is read with its portrait "top" edge
- * on the viewer's left.
- *
- * If the board is mounted the other way round, flip both axes by swapping the
- * two expressions above for
- *
- *     px = ly
- *     py = (LANDSCAPE_W - 1) - lx
- *
- * which is the 90-degree counter-clockwise rotation; nothing else in the
- * driver changes, since the addressing is symmetric.
- *
- * Feeding the panel in its own scan order means iterating the destination and
- * gathering from the source, which is why this reads source pixels one at a
- * time rather than streaming them.
- *
- * The destination byte layout is the ST730x "evil" format: each byte holds a
- * 4-wide by 2-tall block of pixels, ordered
- *
- *     p1 p3 p5 p7      <- MSB first, top row
- *     p2 p4 p6 p8         bottom row
- *
- * i.e. bit 7 is the top-left pixel of the block, bit 6 the one directly below
- * it, bit 5 the next column's top pixel, and so on. Two panel rows are
- * therefore produced together, which is exactly one row address.
- *
- * Returns the number of panel row-address strips written into the conversion
- * buffer, i.e. how many pairs of panel rows are ready to send.
- */
-static uint32_t st7306_rotate_strips(const struct device *dev, const uint8_t *src,
-				     uint32_t first_strip, uint32_t max_strips)
+static uint32_t st7306_rotate_strips(const struct st7306_config *config,
+				     const uint8_t *landscape_frame, uint32_t first_strip,
+				     uint32_t max_strips)
 {
-	const struct st7306_config *config = dev->config;
-	const uint32_t src_stride = LANDSCAPE_W / 8;
+	const uint32_t landscape_stride = LANDSCAPE_W / BITS_PER_BYTE;
 	uint32_t strips = 0;
 
-	for (; strips < max_strips; strips++) {
-		const uint32_t py = (first_strip + strips) * ST7306_PIXELS_PER_ROW_ADDR;
-		uint8_t *dst = &config->conversion_buf[strips * PANEL_STRIP_BYTES];
+	for (; strips < max_strips && first_strip + strips < PANEL_STRIPS; strips++) {
+		const uint32_t top_x = (first_strip + strips) * ST7306_PIXELS_PER_ROW_ADDR;
+		const uint32_t bottom_x = top_x + 1;
+		const uint32_t top_byte = top_x / BITS_PER_BYTE;
+		const uint32_t bottom_byte = bottom_x / BITS_PER_BYTE;
+		const uint8_t top_mask = MONO_MSB_FIRST_MASK(top_x);
+		const uint8_t bottom_mask = MONO_MSB_FIRST_MASK(bottom_x);
+		uint8_t *strip = &config->conversion_buf[strips * PANEL_STRIP_BYTES];
 
-		if (py >= PANEL_H) {
-			break;
-		}
+		memset(strip, 0, PANEL_STRIP_BYTES);
 
-		/*
-		 * py and py + 1 are two adjacent panel rows, which under the
-		 * mapping above are two adjacent landscape columns: lx = py
-		 * and lx = py + 1. Walking px across the panel walks ly back
-		 * up the landscape image.
-		 */
-		const uint32_t lx_top = py;
-		const uint32_t lx_bot = py + 1;
-		const uint8_t top_mask = 0x80U >> (lx_top % 8);
-		const uint8_t bot_mask = 0x80U >> (lx_bot % 8);
-		const uint32_t top_byte = lx_top / 8;
-		const uint32_t bot_byte = lx_bot / 8;
+		for (uint32_t panel_column = 0; panel_column < PANEL_W; panel_column++) {
+			const uint32_t landscape_y = LANDSCAPE_H - 1 - panel_column;
+			const uint8_t *landscape_row = &landscape_frame[landscape_y * landscape_stride];
+			const uint32_t shift =
+				NATIVE_BLOCK_FIRST_COLUMN_SHIFT -
+				NATIVE_BLOCK_ROWS * (panel_column % NATIVE_BLOCK_COLUMNS);
+			uint8_t column_pair = 0;
 
-		memset(dst, 0, PANEL_STRIP_BYTES);
-
-		for (uint32_t px = 0; px < PANEL_W; px++) {
-			const uint32_t ly = (LANDSCAPE_H - 1) - px;
-			const uint8_t *row = &src[ly * src_stride];
-			uint8_t bits = 0;
-
-			/*
-			 * Bit placement within the byte.
-			 *
-			 * One byte holds a 4-wide by 2-tall block of panel
-			 * pixels. The leftmost of the four columns takes the
-			 * highest bit pair, and within a pair the upper panel
-			 * row is the odd (higher) bit:
-			 *
-			 *     bit  7 6 | 5 4 | 3 2 | 1 0
-			 *          c0  |  c1 |  c2 |  c3   <- panel columns
-			 *         t b  | t b | t b | t b
-			 *
-			 * This matches Waveshare's own driver, whose landscape
-			 * lookup table computes the same block as
-			 * bit = 7 - ((px & 3) << 1 | (py & 1)).
-			 *
-			 * Getting this order backwards mirrors the image
-			 * within each 4-pixel block, which on the glass reads
-			 * as a skew across the width rather than as an obvious
-			 * flip.
-			 */
-			const uint32_t shift = 6U - 2U * (px % 4);
-
-			if (row[top_byte] & top_mask) {
-				bits |= 0x2;
+			if (landscape_row[top_byte] & top_mask) {
+				column_pair |= NATIVE_BLOCK_TOP_ROW_BIT;
 			}
-			if (row[bot_byte] & bot_mask) {
-				bits |= 0x1;
+			if (landscape_row[bottom_byte] & bottom_mask) {
+				column_pair |= NATIVE_BLOCK_BOTTOM_ROW_BIT;
 			}
 
-			dst[px / 4] |= bits << shift;
+			strip[panel_column / NATIVE_BLOCK_COLUMNS] |= column_pair << shift;
 		}
 	}
 
 	return strips;
 }
 
+static int st7306_check_frame(const uint16_t x, const uint16_t y,
+			      const struct display_buffer_descriptor *desc)
+{
+	if (desc->pitch != desc->width) {
+		LOG_ERR("Pitch (%u) must equal width (%u)", desc->pitch, desc->width);
+		return -EINVAL;
+	}
+
+	if (x != 0 || y != 0 || desc->width != LANDSCAPE_W || desc->height != LANDSCAPE_H) {
+		LOG_ERR("Only full-frame writes are supported (got %ux%u at %u,%u, expected %ux%u "
+			"at 0,0)",
+			desc->width, desc->height, x, y, LANDSCAPE_W, LANDSCAPE_H);
+		return -ENOTSUP;
+	}
+
+	if (desc->buf_size < (LANDSCAPE_W * LANDSCAPE_H) / BITS_PER_BYTE) {
+		LOG_ERR("Display buffer too small (%u)", desc->buf_size);
+		return -EINVAL;
+	}
+
+	return 0;
+}
+
 static int st7306_write(const struct device *dev, const uint16_t x, const uint16_t y,
 			const struct display_buffer_descriptor *desc, const void *buf)
 {
 	const struct st7306_config *config = dev->config;
-	const uint8_t *src = buf;
-	uint32_t strip = 0;
-	uint32_t total_strips;
+	const uint32_t strips_per_chunk = config->conversion_buf_size / PANEL_STRIP_BYTES;
+	const uint8_t column_addresses[] = {
+		config->start_column / ST7306_PIXELS_PER_COL_ADDR,
+		(config->start_column + PANEL_W) / ST7306_PIXELS_PER_COL_ADDR - 1,
+	};
+	const uint8_t row_addresses[] = {
+		0,
+		PANEL_STRIPS - 1,
+	};
 	int err;
 
-	if (desc->height == 0 || desc->width == 0) {
+	if (desc->width == 0 || desc->height == 0) {
 		return 0;
 	}
 
@@ -511,49 +318,17 @@ static int st7306_write(const struct device *dev, const uint16_t x, const uint16
 		return -EINVAL;
 	}
 
-	if (desc->pitch != desc->width) {
-		LOG_ERR("Pitch (%u) must equal width (%u)", desc->pitch, desc->width);
-		return -EINVAL;
-	}
-
-	/*
-	 * Only full-frame updates are accepted.
-	 *
-	 * A partial landscape area maps to a partial panel area whose column
-	 * span must still land on 12-pixel boundaries, and the driver reports
-	 * SCREEN_INFO_X_ALIGNMENT_WIDTH so that Zephyr's mono rounder widens
-	 * every invalidated area to the full width. Combined with
-	 * CONFIG_LV_Z_FULL_REFRESH the flush is always the whole screen, so
-	 * rejecting anything else keeps one addressing path instead of two.
-	 */
-	if (x != 0 || y != 0 || desc->width != LANDSCAPE_W || desc->height != LANDSCAPE_H) {
-		LOG_ERR("Only full-frame writes are supported (got %ux%u at %u,%u, expected %ux%u "
-			"at 0,0)",
-			desc->width, desc->height, x, y, LANDSCAPE_W, LANDSCAPE_H);
-		return -ENOTSUP;
-	}
-
-	if (desc->buf_size < (LANDSCAPE_W * LANDSCAPE_H) / 8) {
-		LOG_ERR("Display buffer too small (%u)", desc->buf_size);
-		return -EINVAL;
-	}
-
-	/* Address the whole panel: the full column and row range. */
-	const uint8_t col_addrs[] = {
-		config->start_column / ST7306_PIXELS_PER_COL_ADDR,
-		(config->start_column + PANEL_W) / ST7306_PIXELS_PER_COL_ADDR - 1,
-	};
-	const uint8_t row_addrs[] = {
-		0,
-		PANEL_H / ST7306_PIXELS_PER_ROW_ADDR - 1,
-	};
-
-	err = st7306_cmd(dev, ST7306_SET_COLUMN_ADDR, col_addrs, 2);
+	err = st7306_check_frame(x, y, desc);
 	if (err < 0) {
 		return err;
 	}
 
-	err = st7306_cmd(dev, ST7306_SET_ROW_ADDR, row_addrs, 2);
+	err = st7306_cmd(dev, ST7306_SET_COLUMN_ADDR, column_addresses, sizeof(column_addresses));
+	if (err < 0) {
+		return err;
+	}
+
+	err = st7306_cmd(dev, ST7306_SET_ROW_ADDR, row_addresses, sizeof(row_addresses));
 	if (err < 0) {
 		return err;
 	}
@@ -563,38 +338,22 @@ static int st7306_write(const struct device *dev, const uint16_t x, const uint16
 		return err;
 	}
 
-	total_strips = PANEL_H / ST7306_PIXELS_PER_ROW_ADDR;
+	for (uint32_t strip = 0; strip < PANEL_STRIPS;) {
+		const uint32_t converted =
+			st7306_rotate_strips(config, buf, strip, strips_per_chunk);
 
-	/*
-	 * Convert and send in chunks that fit the conversion buffer, so the
-	 * driver never needs a second full framebuffer.
-	 */
-	while (strip < total_strips) {
-		const uint32_t max_strips = config->conversion_buf_size / PANEL_STRIP_BYTES;
-		struct display_buffer_descriptor mipi_desc = { 0 };
-		uint32_t done;
+		strip += converted;
 
-		done = st7306_rotate_strips(dev, src, strip, max_strips);
-		if (done == 0) {
-			LOG_ERR("Conversion made no progress");
-			return -EIO;
-		}
-
-		strip += done;
-
-		/*
-		 * The descriptor describes the data as the panel sees it: a
-		 * PANEL_W-wide block of (done * 2) panel rows.
-		 */
-		mipi_desc.buf_size = done * PANEL_STRIP_BYTES;
-		mipi_desc.width = PANEL_W;
-		mipi_desc.height = done * ST7306_PIXELS_PER_ROW_ADDR;
-		mipi_desc.pitch = PANEL_W;
-		mipi_desc.frame_incomplete = (strip < total_strips);
+		struct display_buffer_descriptor chunk = {
+			.buf_size = converted * PANEL_STRIP_BYTES,
+			.width = PANEL_W,
+			.height = converted * ST7306_PIXELS_PER_ROW_ADDR,
+			.pitch = PANEL_W,
+			.frame_incomplete = strip < PANEL_STRIPS,
+		};
 
 		err = mipi_dbi_write_display(config->mipi_dev, &config->dbi_config,
-					     config->conversion_buf, &mipi_desc,
-					     PIXEL_FORMAT_MONO01);
+					     config->conversion_buf, &chunk, PIXEL_FORMAT_MONO01);
 		if (err < 0) {
 			return err;
 		}
@@ -612,40 +371,6 @@ static void st7306_get_capabilities(const struct device *dev, struct display_cap
 	caps->y_resolution = LANDSCAPE_H;
 	caps->supported_pixel_formats = PIXEL_FORMAT_MONO01;
 	caps->current_pixel_format = PIXEL_FORMAT_MONO01;
-
-	/*
-	 * Ask Zephyr's mono rounder for full-width areas.
-	 *
-	 * The generic rounder aligns with a bitmask (x1 &= ~(w - 1)), which is
-	 * only correct for power-of-two widths; this controller's 12-pixel
-	 * unit is not one, so that path emits unaligned coordinates. Declaring
-	 * an X alignment requirement makes lvgl_rounder_cb_mono() take its
-	 * first branch instead and set the area to the full display width,
-	 * which is always correctly aligned.
-	 */
-	/*
-	 * SCREEN_INFO_MONO_MSB_FIRST is essential, not cosmetic.
-	 *
-	 * Zephyr's mono LVGL glue repacks the frame before handing it over, and
-	 * lvgl_display_mono.c's set_px_at_pos() picks the destination bit from
-	 * this flag:
-	 *
-	 *     if (caps->screen_info & SCREEN_INFO_MONO_MSB_FIRST)
-	 *             bit = 7 - x % 8;
-	 *     else
-	 *             bit = x % 8;
-	 *
-	 * Without the flag it packs each byte LSB-first, reversing the pixel
-	 * order inside every group of 8 while leaving the groups themselves in
-	 * place. On the glass that shows up as the image being sliced into
-	 * 8-pixel bands with each band mirrored - a tear every 8 pixels rather
-	 * than a whole-image flip, which is what makes it look like a stride
-	 * bug instead of a bit-order one.
-	 *
-	 * This driver reads source pixels MSB-first (0x80 >> (lx % 8)), which
-	 * is also how LVGL itself stores I1, so the flag simply tells the glue
-	 * to leave that convention alone.
-	 */
 	caps->screen_info = SCREEN_INFO_X_ALIGNMENT_WIDTH | SCREEN_INFO_MONO_MSB_FIRST;
 }
 
@@ -672,16 +397,12 @@ static int st7306_init(const struct device *dev)
 		return -ENODEV;
 	}
 
-	err = mipi_dbi_reset(config->mipi_dev, ST7306_RESET_DELAY);
+	err = mipi_dbi_reset(config->mipi_dev, ST7306_RESET_DELAY_MS);
 	if (err < 0) {
 		LOG_ERR("Failed to reset display (%d)", err);
 		return err;
 	}
 
-	/*
-	 * The controller is configured while asleep, matching the datasheet's
-	 * power-on flow, then woken once the rails and waveforms are set.
-	 */
 	err = st7306_suspend(dev);
 	if (err < 0) {
 		return err;
@@ -719,17 +440,13 @@ static DEVICE_API(display, st7306_api) = {
 	.set_pixel_format = st7306_set_pixel_format,
 };
 
-/*
- * Conversion buffer, sized in whole panel row-address strips so the chunking
- * loop never splits one.
- */
 static uint8_t st7306_conv_buf[CONFIG_ST7306_WAVESHARE_CONV_BUFFER_STRIPS * PANEL_STRIP_BYTES];
 
 static struct st7306_data st7306_data_0;
 
 static const struct st7306_config st7306_config_0 = {
 	.mipi_dev = DEVICE_DT_GET(DT_INST_PARENT(0)),
-	.dbi_config = MIPI_DBI_CONFIG_DT_INST(0, SPI_WORD_SET(8) | SPI_OP_MODE_MASTER, 0),
+	.dbi_config = MIPI_DBI_CONFIG_DT_INST(0, SPI_WORD_SET(8) | SPI_OP_MODE_CONTROLLER, 0),
 	.start_line = DT_INST_PROP(0, start_line),
 	.start_column = DT_INST_PROP(0, start_column),
 	.nvm_load = DT_INST_PROP(0, nvm_load),
@@ -742,7 +459,7 @@ static const struct st7306_config st7306_config_0 = {
 	.framerate = DT_INST_PROP(0, framerate),
 	.multiplex_ratio = DT_INST_PROP(0, multiplex_ratio),
 	.source_voltage = DT_INST_PROP(0, source_voltage),
-	.remap_value = DT_INST_PROP(0, remap_value),
+	.remap_value = REMAP_VALUE,
 	.panel_settings = DT_INST_PROP(0, panel_settings),
 	.hpm_gate_waveform = DT_INST_PROP(0, hpm_gate_waveform),
 	.lpm_gate_waveform = DT_INST_PROP(0, lpm_gate_waveform),
